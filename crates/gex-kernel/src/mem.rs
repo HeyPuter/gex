@@ -397,10 +397,10 @@ pub struct MemoryMap {
     high: Option<(u64, u64)>,
     /// The high arena is filled from its top down, not bottom-up.
     high_down: bool,
-    /// Whether running out of address space here is noted in
-    /// [`ADDRESS_SPACE_SHORT`]: the map of the program a run started with
-    /// and its forks, not of another image one of them execs (a new map).
-    learns: bool,
+    /// The largest mapping an M32 map could not place for want of address
+    /// space since [`Self::take_short`] last looked: 0 if none
+    /// (`Kernel::note_short`).
+    short: u64,
     /// Ranges known to hold only zero bytes, sorted and disjoint: memory that
     /// has not been mapped with contents or writable since it was zeroed (a
     /// fresh process's, a reservation the kernel zeroed). Empty means nothing
@@ -563,9 +563,6 @@ const BAND_LARGE: u64 = 1 << 20;
 /// size or more: Windows' allocation granularity.
 const BAND_ALIGN: u64 = 64 << 10;
 
-/// The largest request a map that learns ([`MemoryMap::set_learns`]) could
-/// not place in an M32 memory: 0 if none ran short.
-pub static ADDRESS_SPACE_SHORT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// A host's line for an M64 high arena that is full ([`MemoryMap::find_high`]).
 static HIGH_ARENA_FULL_HOOK: std::sync::OnceLock<fn(u64, u64, u64)> = std::sync::OnceLock::new();
@@ -583,12 +580,6 @@ fn arena_full(lo: u64, hi: u64, len: u64) {
             f(lo, hi, len);
         }
     }
-}
-
-/// Note that a learning M32 process ran out of address space asking for
-/// `len` bytes.
-pub fn note_address_space_short(len: u64) {
-    ADDRESS_SPACE_SHORT.fetch_max(len.max(1), std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Whether `[start, end)` touches guest memory the runtime owns but no VMA
@@ -635,7 +626,7 @@ impl MemoryMap {
             // high arena.
             high: gex_abi::mem64().then_some((gex_abi::IMAGE_ZONE64, gex_abi::LIMIT64)),
             high_down: false,
-            learns: false,
+            short: 0,
             clean: Vec::new(),
             fresh: None,
             take_end: 0,
@@ -645,10 +636,10 @@ impl MemoryMap {
         }
     }
 
-    /// Note this map's running out of address space for the next start of
-    /// its image ([`ADDRESS_SPACE_SHORT`]); an exec's new map does not.
-    pub fn set_learns(&mut self, on: bool) {
-        self.learns = on;
+    /// The largest mapping this M32 map refused for want of address space
+    /// since the last call, cleared: 0 if none.
+    pub fn take_short(&mut self) -> u64 {
+        std::mem::take(&mut self.short)
     }
 
     /// Start again with an empty map (an exec, a snapshot's restore): the
@@ -1164,8 +1155,8 @@ impl MemoryMap {
         };
         let start = take(want);
         if start == 0 {
-            if self.high.is_none() && self.learns {
-                note_address_space_short(len);
+            if self.high.is_none() {
+                self.short = self.short.max(len);
             }
             return Err(Errno::ENOMEM);
         }
@@ -1514,8 +1505,8 @@ impl MemoryMap {
 
         if self.banded {
             let Some(start) = self.place_banded(len, origin.is_none()) else {
-                if self.high.is_none() && self.learns {
-                    note_address_space_short(len);
+                if self.high.is_none() {
+                    self.short = self.short.max(len);
                 }
                 return Err(Errno::ENOMEM);
             };
@@ -1536,8 +1527,8 @@ impl MemoryMap {
                 continue;
             }
             if candidate < len || candidate - len < MMAP_BOTTOM {
-                if self.high.is_none() && self.learns {
-                    note_address_space_short(len);
+                if self.high.is_none() {
+                    self.short = self.short.max(len);
                 }
                 return Err(Errno::ENOMEM);
             }
@@ -2720,27 +2711,17 @@ mod tests {
         assert_eq!(m.mmap(lo, 0x10000, prot::READ, flags::FIXED_NOREPLACE, "exe2"), Err(Errno::EEXIST));
     }
 
-    /// An M32 map is unchanged, and running out of address space is recorded
-    /// for the next start.
+    /// An M32 map is unchanged, and the largest mapping it refused for want
+    /// of address space is kept until taken.
     #[test]
-    fn a_32_bit_memory_records_running_out_of_address_space() {
+    fn a_32_bit_memory_keeps_what_it_fell_short_of() {
         let mut m = MemoryMap::new(0x40_0000);
-        m.set_learns(true);
         let a = m.mmap(0, 0x1000, prot::READ, 0, "x").unwrap();
         assert!(a < MMAP_TOP);
         assert_eq!(m.mmap(1 << 33, 0x1000, prot::READ, flags::FIXED, "f"), Err(Errno::ENOMEM));
+        assert_eq!(m.take_short(), 0);
         while m.mmap(0, 0x1fff_f000, prot::NONE, 0, "res").is_ok() {}
-        assert!(ADDRESS_SPACE_SHORT.load(std::sync::atomic::Ordering::Relaxed) >= 0x1fff_f000);
-    }
-
-    /// A map renewed by an exec (another image) does not learn, nor does a
-    /// new one, until asked.
-    #[test]
-    fn only_a_learning_map_records_running_out() {
-        let mut m = MemoryMap::new(0x40_0000);
-        m.set_learns(true);
-        m.renew(0x40_0000);
-        assert!(!m.learns);
-        assert!(!MemoryMap::new(0x40_0000).learns);
+        assert_eq!(m.take_short(), 0x1fff_f000);
+        assert_eq!(m.take_short(), 0);
     }
 }

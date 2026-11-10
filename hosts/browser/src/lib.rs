@@ -4269,6 +4269,13 @@ fn install_panic_hook() {
         // the process's stderr beside the guest's own complaint: a Worker's
         // console reaches no log a game run keeps.
         gex_kernel::mem::set_say(|s| unsafe { write_stderr(s) });
+        // A 64-bit guest that outgrew the lowered memory gets the 64-bit
+        // one at its next start, where the page runs both.
+        gex_kernel::syscalls::set_outgrow_host(gex_kernel::syscalls::OutgrowHost {
+            reachable: || !gex_abi::mem64() && vfork::page_runs_mem64(),
+            debug: |s| trace_line(&format!("[gex] {s}")),
+            say: |s| warn_line(&format!("[gex-info] {s}")),
+        });
         std::panic::set_hook(Box::new(|info| {
             // Set while this hook runs: a panic inside it is not reported
             // through it (std aborts at once, its line on a stderr that
@@ -4364,6 +4371,8 @@ fn set_host(host: Host) {
     // A new process: its registry starts empty, whatever a fork copied.
     regview::reset();
     regview::publish_marks(&jit_lock().lock().page_table);
+    // Before the program's first call, free or locked.
+    install_panic_hook();
     // A fork copies the parent's memory, translation in flight or not; the
     // child's JIT state is the `host` given here.
     jitout::OUT.store(0, std::sync::atomic::Ordering::Release);
@@ -4387,6 +4396,8 @@ fn set_host(host: Host) {
 fn set_host(host: Host) {
     regview::reset();
     regview::publish_marks(&jit_lock().lock().page_table);
+    // Before the program's first call, free or locked.
+    install_panic_hook();
     // A fork copies the parent's memory, translation in flight or not; the
     // child's JIT state is the `host` given here.
     jitout::OUT.store(0, std::sync::atomic::Ordering::Release);
@@ -20440,6 +20451,10 @@ fn publish_exit(pid: i32, status: i32) {
     // SAFETY: no arguments; the host only waits for its own deliveries.
     unsafe { drain_output() };
     if let Some(home) = sigs::home() {
+        // Whether it outgrew its memory, for its next start.
+        // (`status` is an exit code, or a signal's number negated)
+        let word = if status < 0 { (-status) & 0x7f } else { (status & 0xff) << 8 };
+        gex_kernel::syscalls::outgrow_ending(pid, word, home.procs());
         home.procs().exit(pid, status);
     }
 }

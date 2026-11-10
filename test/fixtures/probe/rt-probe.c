@@ -8,6 +8,7 @@
  *   rt-probe chmod PATH MODE   PATH opened, chmod to MODE (octal): the mode
  *                    by fstat of the open descriptor, then by stat
  *   rt-probe xattr PATH NAME   the attribute's value
+ *   rt-probe setxattr PATH NAME VALUE   the attribute set: "set"
  *   rt-probe connect HOST PORT TEXT   TEXT to HOST:PORT (a name: getaddrinfo),
  *                    then what comes back until the far end closes
  *   rt-probe sendto HOST PORT TEXT...   each TEXT a datagram to HOST:PORT
@@ -139,6 +140,12 @@ int main(int argc, char **argv) {
       return 1;
     }
     printf("%.*s\n", (int)n, v);
+  } else if (!strcmp(what, "setxattr") && argc == 5) {
+    if (setxattr(argv[2], argv[3], argv[4], strlen(argv[4]), 0) < 0) {
+      perror("setxattr");
+      return 1;
+    }
+    printf("set\n");
   } else if (!strcmp(what, "connect") && argc == 5) {
     struct addrinfo hints = {0}, *ai;
     hints.ai_socktype = SOCK_STREAM;
@@ -326,7 +333,7 @@ int main(int argc, char **argv) {
     close(fd);
     printf("%ld\n", (long)((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000));
   } else {
-    fprintf(stderr, "usage: rt-probe size|tty|ids|xattr PATH NAME|connect HOST PORT TEXT|sendto HOST PORT TEXT...|udp HOST PORT TEXT|flood HOST PORT N SIZE|hold HOST PORT N [fork|trap] [udp]|serve PORT|tone HZ MS\n");
+    fprintf(stderr, "usage: rt-probe size|tty|ids|xattr PATH NAME|setxattr PATH NAME VALUE|connect HOST PORT TEXT|sendto HOST PORT TEXT...|udp HOST PORT TEXT|flood HOST PORT N SIZE|hold HOST PORT N [fork|trap] [udp]|serve PORT|tone HZ MS\n");
     return 2;
   }
   return 0;

@@ -664,42 +664,41 @@ fn set_wasm_libs() -> Result<()> {
     Ok(())
 }
 
-/// The guest memory for this run: `--mem64`/`--mem32`,
-/// else what an earlier run of the same image learned. `wide` is whether
-/// the guest is 64-bit; a 32-bit guest addresses at most 4 GiB, so it always
-/// has a wasm32 memory.
-fn choose_mem(ra: &mut RunArgs, bytes: &[u8], wide: bool) -> Result<()> {
+/// The guest memory for this run: `--mem64`/`--mem32`, else the program's
+/// own record, its `user.gex.mem64` attribute (`1` or `0`), which gex sets
+/// when a run of it fell short of a 32-bit memory's address space and ended
+/// for it (`outgrow_ending`). `wide` is whether the guest is 64-bit; a
+/// 32-bit guest addresses at most 4 GiB, so it always has a wasm32 memory.
+fn choose_mem(ra: &mut RunArgs, wide: bool) -> Result<()> {
     if ra.mem64 == Some(true) && !wide {
         bail!("--mem64: {} is a 32-bit program, which cannot address more than 4 GiB", ra.path);
     }
-    let m64 = wide && ra.mem64.unwrap_or_else(|| gex_cache::mem64_recorded(bytes));
+    // (for Wine's loader started on a program, the program's record)
+    let argv: Vec<String> = std::iter::once(ra.path.clone()).chain(ra.guest_args.iter().cloned()).collect();
+    let image = gex_kernel::syscalls::wine_program(&ra.path, &argv, &ra.opts.env).unwrap_or_else(|| ra.path.clone());
+    let recorded = || {
+        let path = std::fs::canonicalize(&image).ok()?;
+        let mut b = [0u8; 8];
+        let op = gex_kernel::vfs::XattrOp::Get { name: "user.gex.mem64", buf: &mut b };
+        let n = gex_kernel::vfs::hostfs::host_xattr::call(gex_kernel::vfs::hostfs::host_xattr::On::Path(&path), op).ok()?;
+        match &b[..n] {
+            b"1" | b"1\n" => Some(true),
+            b"0" | b"0\n" => Some(false),
+            _ => None,
+        }
+    };
+    let m64 = wide && ra.mem64.or_else(recorded).unwrap_or(false);
     if m64 && ra.mem64.is_none() {
-        eprintln!("gex: {} runs with a 64-bit memory (an earlier run needed more than 4 GiB)", ra.path);
+        eprintln!("gex: {image} runs with a 64-bit memory (its record says it needs one)");
     }
     ra.opts.mem = if m64 { gex_abi::MemFlavor::M64 } else { gex_abi::MemFlavor::M32 };
     // Everything translated in this process targets it.
     gex_abi::set_mem_flavor(ra.opts.mem);
+    // Its first program may be told later that it needs a 64-bit memory
+    // (an exec that asks for one): the run then starts again with one
+    // (`gex_native::restart_mem64`), unless the flavour was given.
+    gex_native::set_restart_ok(wide && !m64 && ra.mem64.is_none());
     Ok(())
-}
-
-/// After a 64-bit guest's wasm32 run: if it ran out of address space,
-/// record it so the next start has a 64-bit memory.
-fn learn_mem(ra: &RunArgs, bytes: &[u8], wide: bool) {
-    if !wide || ra.opts.mem.is_64() || ra.mem64 == Some(false) {
-        return;
-    }
-    let short = gex_kernel::mem::ADDRESS_SPACE_SHORT.load(std::sync::atomic::Ordering::Relaxed);
-    if short == 0 {
-        return;
-    }
-    if let Some(p) = gex_cache::record_mem64(bytes, &ra.path, short) {
-        eprintln!(
-            "gex: {} needs more than 4 GiB of address space (a request for {short:#x} bytes did not fit); \
-             it runs with --mem64 from the next start ({})",
-            ra.path,
-            p.display()
-        );
-    }
 }
 
 fn cmd_run(args: &[String]) -> Result<ExitCode> {
@@ -805,16 +804,33 @@ fn cmd_run(args: &[String]) -> Result<ExitCode> {
         ra.opts.aot = Some(std::sync::Arc::new(aot));
         ra.opts.pins.extend(pins);
     }
-    choose_mem(&mut ra, &bytes, wide)?;
+    choose_mem(&mut ra, wide)?;
     set_wasm_libs()?;
     let (exit, _stats) = gex_native::run_program(&program, &ra.opts, &ra.xlate)?;
-    learn_mem(&ra, &bytes, wide);
+    if gex_native::restart_mem64() {
+        restart_mem64();
+    }
     if let Some(dir) = gex_native::profile::finish(&exit)? {
         if ra.opts.verbose {
             eprintln!("[gex] profile and session manifest written to {}", dir.display());
         }
     }
     Ok(report_exit(&exit, ra.opts.verbose))
+}
+
+/// Start this run again with a 64-bit memory (`gex_native::restart_mem64`):
+/// the same command line with `--mem64`, in place of this process, which
+/// ends every guest process of the run.
+fn restart_mem64() -> ! {
+    use std::os::unix::process::CommandExt;
+    let mut args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let at = args.iter().position(|a| a == "run").map_or(1, |i| i + 1);
+    args.insert(at, "--mem64".into());
+    eprintln!("gex: needs 64-bit memory: re-running");
+    let exe = std::env::current_exe().unwrap_or_else(|_| args[0].clone().into());
+    let e = std::process::Command::new(exe).arg0(&args[0]).args(&args[1..]).exec();
+    eprintln!("gex: could not start again with a 64-bit memory: {e}");
+    std::process::exit(127);
 }
 
 /// The exit status a shell sees for a guest's exit.

@@ -1060,9 +1060,10 @@ impl TmpFs {
         inner.next_ino += 1;
         inner.set_ino(path.clone(), ino);
         inner.nodes.insert(
-            path,
+            path.clone(),
             Node::File(Arc::new(FileNode::new(contents, ino, self.stored()))),
         );
+        persist::late_laid(&mut inner, &path, ino);
     }
 
     /// Bytes of a seeded file ([`TmpFs::add_file`]) at `offset`, for a seeding
@@ -1115,6 +1116,7 @@ impl TmpFs {
             }
             inner.nodes.insert(path.clone(), Node::File(Arc::clone(&f)));
             let _ = inner.chmod(&path, mode);
+            persist::late_laid(&mut inner, &path, ino);
             f
         };
         self.inner.pending.lock().unwrap().insert(path, f);
@@ -1214,7 +1216,8 @@ impl TmpFs {
         let f = FileNode::new(Vec::new(), ino, self.stored());
         f.mtime.store(LAZY_MTIME, Ordering::Relaxed);
         *f.lazy.lock().unwrap() = Some(Lazy { url: url.to_string(), size, chunks: Default::default(), held: 0, ahead: 0, reads: 0 });
-        inner.nodes.insert(path, Node::File(Arc::new(f)));
+        inner.nodes.insert(path.clone(), Node::File(Arc::new(f)));
+        persist::late_laid(&mut inner, &path, ino);
     }
 
     /// Every file the program has made or changed since the root was seeded

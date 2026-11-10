@@ -508,6 +508,20 @@ async function handle(msg) {
         realError('[gex-console-error]', ...a);
       }
     };
+    // And the other levels, under Node, to the fds the parent's console
+    // would have used: a line said just before the Worker ends (a crash
+    // notice's companion, a process's exec as its vfork child's Worker is
+    // replaced) never reached the parent through the stream, which
+    // `terminate()` drops.
+    const format = globalThis.process?.getBuiltinModule?.('util')?.format;
+    if (fs && format) {
+      const to = (fd, real) => (...a) => {
+        try { fs.writeSync(fd, format(...a) + '\n'); } catch { real(...a); }
+      };
+      console.log = to(1, console.log.bind(console));
+      console.info = to(1, console.info.bind(console));
+      console.warn = to(2, console.warn.bind(console));
+    }
   }
   // Everything the guest writes goes back to whoever started this, posted
   // rather than accumulated so a long run says what it is doing as it runs.

@@ -791,9 +791,44 @@ pub fn run_image(image: &Image, opts: &RunOptions, xlate: &Options) -> Result<(E
     )
 }
 
+/// The run may start again with a 64-bit memory ([`restart_mem64`]).
+static RESTART_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The run ended to start again with a 64-bit memory.
+static RESTART: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the run may start again with a 64-bit memory when its first
+/// process execs a program that needs one: a 64-bit guest's run in a 32-bit
+/// memory whose flavour was not given (gexc `choose_mem`).
+pub fn set_restart_ok(on: bool) {
+    RESTART_OK.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the run ended so as to start again with a 64-bit memory: its
+/// first process exec'd a program that needs one, and stopped there. The
+/// caller starts the whole run again (gexc's `--mem64`); the guest's other
+/// processes end with this one.
+pub fn restart_mem64() -> bool {
+    RESTART.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Run a program, which may carry a dynamic linker alongside it.
 pub fn run_program(program: &Program, opts: &RunOptions, xlate: &Options) -> Result<(Exit, Stats)> {
     gex_kernel::proc::set_crash_hook(crash_line);
+    // A 64-bit guest that outgrew its lowered memory gets a 64-bit one at
+    // its next start (`--mem64` for the whole run, `restart_mem64`).
+    gex_kernel::syscalls::set_outgrow_host(gex_kernel::syscalls::OutgrowHost {
+        reachable: || true,
+        debug: |s| {
+            if log_on() {
+                eprint!("[gex] {s}");
+            }
+        },
+        say: |s| {
+            if !log_quiet() {
+                eprint!("gex: {s}");
+            }
+        },
+    });
     run_program_with(program, opts, xlate, None)
 }
 
@@ -1140,9 +1175,6 @@ fn run_program_with(
             {
                 let mut k = Kernel::new(ctx_addr, image.brk, exe_path.clone());
                 k.pins = std::sync::Arc::new(opts.pins.clone());
-                // The run's first program: what it learns about its address
-                // space is its image's (gexc `learn_mem`), not an exec'd one's.
-                k.mem.lock().set_learns(true);
                 k
             },
             // Filled when the process is first published (`publish_proc`).
@@ -1560,6 +1592,17 @@ fn run_program_with(
     };
     if let Stopped::Exec(req) = stopped {
         stop_other_threads(&spawn, opts.verbose);
+        // The run's first process execs a program that needs a 64-bit
+        // memory (its GEX_MEM64=1, its record, its headers): one host
+        // process has one memory flavour, so the run starts again with one.
+        let to_m64 = {
+            let k = spawn.kernel.lock().unwrap_or_else(|e| e.into_inner());
+            k.pid == gex_kernel::INIT_PID && k.exec_mem64 == Some(true) && !gex_abi::mem64()
+        };
+        if to_m64 && RESTART_OK.load(std::sync::atomic::Ordering::Relaxed) {
+            RESTART.store(true, std::sync::atomic::Ordering::Relaxed);
+            return Ok((Exit::Status(0), Stats::default()));
+        }
         let kernel = take_kernel(&spawn);
         let (proc_state, wayland) = (Arc::clone(&spawn.proc_state), spawn.wayland.clone());
         // The old image's memory goes before the new one runs: every holder
@@ -2920,6 +2963,9 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
                 let mut k = kernel.lock().unwrap_or_else(|e| e.into_inner());
                 k.fds.close_all();
             }
+            // Whether it outgrew its memory (one that exec'd was looked at
+            // as its program ended, `report_first_end`).
+            gex_kernel::syscalls::outgrow_ending(pid, wstatus, &procs);
             procs.exit(pid, wstatus);
             usage::forget(pid);
             let (st, done) = status;
@@ -2982,10 +3028,13 @@ fn crash_note(exit: &Exit) -> Option<Vec<u8>> {
 /// The run's first process (pid 1, whose end is gexc's) ends with `exit`:
 /// nothing collects it, so its crash, if it is one, is reported here.
 fn report_first_end(spawn: &SpawnContext, pid: i32, exit: &Exit) {
+    let procs = Arc::clone(&spawn.kernel.lock().unwrap_or_else(|e| e.into_inner()).procs);
+    // Any program's end (an exec'd child's too, whose table entry its
+    // thread then ends): whether it outgrew its memory.
+    gex_kernel::syscalls::outgrow_ending(pid, exit.wait_status(), &procs);
     if pid != gex_kernel::INIT_PID {
         return;
     }
-    let procs = Arc::clone(&spawn.kernel.lock().unwrap_or_else(|e| e.into_inner()).procs);
     if let Some(note) = crash_note(exit) {
         procs.set_crash_unless_said(pid, &note);
     }

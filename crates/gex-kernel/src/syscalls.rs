@@ -601,6 +601,10 @@ pub struct Kernel {
     /// `user.gex.mem64` attribute (the learned record). The shim takes it
     /// when it places the exec.
     pub exec_mem64: Option<bool>,
+    /// The Windows program the running image is Wine's loader for (the
+    /// exec's `WINEGEX_IMAGE`, or the DOS path Wine was started on by
+    /// hand): where its memory flavour is recorded ([`outgrow_ending`]).
+    pub exec_image: Option<String>,
     /// The argument and environment vectors, for `/proc/self/cmdline`.
     pub argv: Vec<String>,
     pub envp: Vec<String>,
@@ -873,6 +877,153 @@ pub const ITIMER_PROF: usize = 2;
 /// panics there -- so the browser host passes its own, and everything else
 /// gets [`system_clock`].
 pub type ClockFn = fn() -> (u64, u32);
+
+/// A host's part in moving a program that outgrew its lowered memory to a
+/// 64-bit one ([`note_short`], [`outgrow_ending`]).
+pub struct OutgrowHost {
+    /// Whether this host can run a program in a 64-bit memory.
+    pub reachable: fn() -> bool,
+    /// A debug-level line (off by default), without the host's prefix.
+    pub debug: fn(&str),
+    /// A line at the default level, without the host's prefix.
+    pub say: fn(&str),
+}
+
+static OUTGROW_HOST: std::sync::OnceLock<OutgrowHost> = std::sync::OnceLock::new();
+
+/// Set the host's [`OutgrowHost`], once. Without it nothing is recorded.
+pub fn set_outgrow_host(h: OutgrowHost) {
+    let _ = OUTGROW_HOST.set(h);
+}
+
+/// The smallest reservation [`Kernel::note_short`] records: 64-bit Wine
+/// probes its user space's top with a 1 MiB one in every process.
+const OUTGROW_MIN: u64 = 4 << 20;
+
+/// The largest one a 64-bit memory could hold: its high arena above the
+/// memory64 tables.
+const OUTGROW_MAX: u64 = gex_abi::LIMIT64 - gex_abi::HIGH_TABLES_END;
+
+/// How soon after falling short an abnormal end counts as caused by it
+/// ([`outgrow_ending`]): 60 s. A program that cannot do without the
+/// reservation fails within moments (its allocator's error, a null
+/// pointer used), but may first show an error dialog someone has to
+/// dismiss. A wrong guess costs a program only a 64-bit memory it did not
+/// need; one that carries on past this was not stopped by it.
+pub const OUTGROW_WINDOW_NS: u64 = 60_000_000_000;
+
+/// A process's record for moving it to a 64-bit memory
+/// ([`Kernel::outgrow_arm`], [`note_short`], [`outgrow_ending`]).
+struct Outgrow {
+    pid: i32,
+    /// Where the record goes: the Windows program, or the program.
+    image: Option<String>,
+    /// It asked to keep the lowered memory (GEX_MEM64=0, a `0` record).
+    stay32: bool,
+    /// Its namespace, which [`outgrow_ending`] sets the record through
+    /// without the kernel (a host ends a process with it held).
+    ns: Arc<crate::vfs::VfsView>,
+    clock: ClockFn,
+    /// The largest reservation that did not fit, and when (ns).
+    short: Option<(u64, u64)>,
+}
+
+static OUTGROW: crate::sync::Mutex<Vec<Outgrow>> = crate::sync::Mutex::new(Vec::new());
+
+fn raw_ns(clock: ClockFn) -> u64 {
+    let (secs, nanos) = clock();
+    secs.saturating_mul(1_000_000_000).saturating_add(nanos as u64)
+}
+
+/// The Windows program Wine's loader (`path`) was started on by hand
+/// (`wine C:\\app.exe`, not by CreateProcess, which says it in
+/// WINEGEX_IMAGE): its first argument (`argv[1]`), a DOS path, found
+/// through the prefix's dosdevices. `None` for any other program.
+pub fn wine_program(path: &str, argv: &[String], envp: &[String]) -> Option<String> {
+    let wine = path.rsplit('/').next().is_some_and(|n| n == "wine" || n == "wine.m64");
+    let a = argv.get(1).filter(|a| wine && a.len() > 3 && a.as_bytes()[1] == b':' && a.as_bytes()[2] == b'\\')?;
+    let pfx = envp.iter().find_map(|e| e.strip_prefix("WINEPREFIX="))?;
+    Some(format!("{pfx}/dosdevices/{}:/{}", a[..1].to_ascii_lowercase(), a[3..].replace('\\', "/")))
+}
+
+/// A reservation of `len` bytes process `pid` asked for found no room in
+/// its lowered memory (an `mmap` the kernel refused for want of address
+/// space, or 64-bit Wine's [`crate::proc::PR_GEX_SHORT`]). Only recorded,
+/// with when (the largest since its exec): the call still fails, as many
+/// programs try a large reservation and then a smaller one. If the process
+/// then ends abnormally soon after ([`outgrow_ending`]), its image is
+/// recorded for a 64-bit memory. Nothing is recorded for a small ask, a
+/// 32-bit guest (`compat`, `wasm32`), one already in a 64-bit memory or
+/// asked to stay out of one, an ask a 64-bit memory could not hold either,
+/// or a host that cannot run the 64-bit flavour.
+pub fn note_short(pid: i32, len: u64, compat: bool, wasm32: bool) {
+    // (the host is asked when the process ends: a page Worker's first
+    // calls can come before its host has set itself up)
+    if len < OUTGROW_MIN || len > OUTGROW_MAX || gex_abi::mem64() || compat || wasm32 {
+        return;
+    }
+    let mut all = OUTGROW.lock();
+    let Some(o) = all.iter_mut().find(|o| o.pid == pid && !o.stay32) else { return };
+    if o.short.is_none_or(|(had, _)| len > had) {
+        o.short = Some((len, raw_ns(o.clock)));
+    }
+    drop(all);
+    if let Some(host) = OUTGROW_HOST.get() {
+        (host.debug)(&format!("pid {pid}: a reservation of {len:#x} bytes did not fit its 32-bit memory\n"));
+    }
+}
+
+/// Process `pid` is ending with wait status `status`. One that fell short
+/// of address space ([`Kernel::note_short`]) and ends abnormally (a signal
+/// that dumps core, or a nonzero exit) within [`OUTGROW_WINDOW_NS`] of it
+/// has its image recorded for a 64-bit memory (`user.gex.mem64` = `1`,
+/// which [`Kernel::exec_flavour`] and gexc read at its next start), and its
+/// crash notice says so, or that the record could not be made. A process
+/// that carried on, or exited 0, keeps its memory. Hosts call this as the
+/// process ends, before `procs` hears of it.
+pub fn outgrow_ending(pid: i32, status: i32, procs: &crate::proc::ProcTable) {
+    let Some(host) = OUTGROW_HOST.get() else { return };
+    let rec = {
+        let mut all = OUTGROW.lock();
+        let Some(i) = all.iter().position(|o| o.pid == pid) else { return };
+        all.swap_remove(i)
+    };
+    let Some((len, at)) = rec.short else { return };
+    let sig = (status & 0x7f) as u32;
+    let abnormal = match sig {
+        0 => (status >> 8) & 0xff != 0,
+        0x7f => false,
+        s => matches!(s, 3 | 4 | 5 | 6 | 7 | 8 | 11 | 24 | 25 | 31),
+    };
+    if !abnormal || raw_ns(rec.clock).saturating_sub(at) > OUTGROW_WINDOW_NS || !(host.reachable)() {
+        return;
+    }
+    let set = match &rec.image {
+        Some(p) => rec.ns.get().xattr(p, true, crate::vfs::XattrOp::Set { name: "user.gex.mem64", value: b"1", flags: 0 }).map(|_| ()),
+        None => Err(Errno::ENOENT),
+    };
+    let line = match set {
+        Ok(()) => {
+            (host.say)(&format!(
+                "{} needs 64-bit memory (a reservation of {:#x} bytes did not fit); it gets it from its next start\n",
+                rec.image.as_deref().unwrap_or(""),
+                len
+            ));
+            "needs 64-bit memory; it will get it the next time it starts".to_string()
+        }
+        Err(e) => {
+            let why = match e {
+                Errno::EROFS => "its file is on a read-only filesystem".to_string(),
+                Errno::EOPNOTSUPP => "its filesystem keeps no extended attributes".to_string(),
+                Errno::EACCES | Errno::EPERM => "its file may not be changed".to_string(),
+                Errno::ENOENT if rec.image.is_none() => "which program it is is not known".to_string(),
+                e => format!("error {}", e.0),
+            };
+            format!("needs 64-bit memory, which could not be recorded for its next start ({why}): start it with GEX_MEM64=1")
+        }
+    };
+    procs.add_crash_line(pid, &line);
+}
 
 /// Whether an `EPIPE` from syscall `n` also raises SIGPIPE, as Linux does
 /// for a write to a pipe or stream socket with no reader -- except a `send`
@@ -6920,6 +7071,12 @@ pub fn quiet_call(io: &FdIo<'_>, procs: &ProcTable, tid: i32, m: &mut GuestMem<'
                 procs.set_crash(io.pid, &note);
                 Ok(0)
             }
+            // A reservation the lowered memory had no room for, as 64-bit
+            // Wine says it (it never asks for a mapping it found no gap for).
+            crate::proc::PR_GEX_SHORT => {
+                note_short(io.pid, a[1], io.compat, false);
+                Ok(0)
+            }
             _ => Ok(0),
         },
         // Everything written made durable: the block store's dirty blocks
@@ -7528,6 +7685,13 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
         r
     } else if is_mapping(n) {
         let Some(r) = f.map.call(m, n, a) else { unreachable!("free_class admitted a call MapIo does not make") };
+        // A mapping the lowered memory had no room for.
+        if r == Err(Errno::ENOMEM) && matches!(n, nr::MMAP | nr::MREMAP) {
+            let len = f.map.mem.lock().take_short();
+            if len != 0 {
+                note_short(f.pid, len, compat, f.wasm32);
+            }
+        }
         r
     } else if is_own_state(n) {
         let now = || {
@@ -9635,6 +9799,7 @@ impl Kernel {
             tid: 1,
             exe_path,
             exec_mem64: None,
+            exec_image: None,
             argv: Vec::new(),
             envp: Vec::new(),
             creds: Creds::new(1000, 1000),
@@ -9695,25 +9860,18 @@ impl Kernel {
     /// `WINEGEX_IMAGE=<path>` entry: Wine execs its loader for every Windows
     /// program, and names the program's `.exe` there, so the attribute on
     /// the `.exe` applies to that program's process alone. That entry is
-    /// removed too.
+    /// removed too. Wine's loader started on a program by hand, with no
+    /// WINEGEX_IMAGE, names it as its first argument, a DOS path, found
+    /// through WINEPREFIX's dosdevices. The program is kept as
+    /// [`Kernel::exec_image`].
     ///
-    /// Neither saying, the image itself may (Wine's loader named on a DOS
-    /// path, its first argument, found through WINEPREFIX's dosdevices,
-    /// when no WINEGEX_IMAGE names it): an x86-64 one that cannot be
+    /// Neither saying, the image itself may: an x86-64 one that cannot be
     /// loaded anywhere but above the lowered memory's code space
     /// ([`pe_needs_mem64`]) asks for a 64-bit memory.
-    pub fn exec_flavour(&self, path: &str, argv: &[String], envp: &mut Vec<String>) -> Option<bool> {
+    pub fn exec_flavour(&mut self, path: &str, argv: &[String], envp: &mut Vec<String>) -> Option<bool> {
         let mut flag = None;
         let mut image = None;
-        // Wine's loader started on a program by hand (`wine C:\app.exe`,
-        // not by CreateProcess, so no WINEGEX_IMAGE): the program is its
-        // first argument, a DOS path, found through the prefix's dosdevices.
-        let wine = path.rsplit('/').next().is_some_and(|n| n == "wine" || n == "wine.m64");
-        let dos = argv.get(1).filter(|a| wine && a.len() > 3 && a.as_bytes()[1] == b':' && a.as_bytes()[2] == b'\\');
-        let by_hand = dos.and_then(|a| {
-            let pfx = envp.iter().find_map(|e| e.strip_prefix("WINEPREFIX="))?;
-            Some(format!("{pfx}/dosdevices/{}:/{}", a[..1].to_ascii_lowercase(), a[3..].replace('\\', "/")))
-        });
+        let by_hand = wine_program(path, argv, envp);
         envp.retain(|e| {
             if let Some(v) = e.strip_prefix("GEX_MEM64=") {
                 flag = Some(v == "1");
@@ -9724,10 +9882,12 @@ impl Kernel {
             }
             false
         });
-        flag.or_else(|| {
+        self.exec_image = image.or(by_hand);
+        let image = self.exec_image.as_deref().unwrap_or(path);
+        let want = flag.or_else(|| {
             let mut b = [0u8; 8];
             let op = crate::vfs::XattrOp::Get { name: "user.gex.mem64", buf: &mut b };
-            let n = self.vfs.xattr(image.as_deref().unwrap_or(path), true, op).ok()?;
+            let n = self.vfs.xattr(image, true, op).ok()?;
             match &b[..n] {
                 b"1" | b"1\n" => Some(true),
                 b"0" | b"0\n" => Some(false),
@@ -9735,10 +9895,55 @@ impl Kernel {
             }
         })
         .or_else(|| {
-            let image = image.as_deref().or(by_hand.as_deref()).unwrap_or(path);
             let head = self.read_head(image, 4096)?;
             pe_needs_mem64(&head).then_some(true)
-        })
+        });
+        // The new program's record, its own reservations to come.
+        let was = std::mem::replace(&mut self.exec_mem64, want);
+        self.outgrow_arm(path, true);
+        self.exec_mem64 = was;
+        want
+    }
+
+    /// A reservation of `len` bytes found no room in this process's
+    /// lowered memory: [`note_short`].
+    pub fn note_short(&mut self, len: u64) {
+        note_short(self.pid, len, self.compat, self.wasm32);
+    }
+
+    /// Ready this process's record for [`note_short`] and
+    /// [`outgrow_ending`]: the program it runs now (`path`, or the Windows
+    /// program Wine's loader runs), and whether it asked to keep the
+    /// lowered memory. At each exec (`exec`), which starts a new record,
+    /// and at a program's publication, which only fills in one the process
+    /// lacks (a host may publish before it knows the program's path, and
+    /// after its first reservations).
+    pub fn outgrow_arm(&self, path: &str, exec: bool) {
+        // (whether the host can move it is asked when it falls short: a
+        // host may set itself up after its first program is published)
+        if gex_abi::mem64() {
+            return;
+        }
+        // Never Wine's loader, which every Windows program shares.
+        let loader = |p: &str| p.rsplit('/').next().is_some_and(|n| n == "wine" || n == "wine.m64");
+        // (a process's first program, which no exec named, may be Wine's
+        // loader started by hand)
+        let image = self
+            .exec_image
+            .clone()
+            .or_else(|| (!exec).then(|| wine_program(path, &self.argv, &self.envp)).flatten())
+            .or_else(|| (!path.is_empty() && !loader(path)).then(|| path.to_string()));
+        let stay32 = self.exec_mem64 == Some(false);
+        let mut all = OUTGROW.lock();
+        match all.iter_mut().find(|o| o.pid == self.pid) {
+            Some(o) if exec => *o = Outgrow { pid: self.pid, image, stay32, ns: Arc::clone(self.vfs.view()), clock: self.clock, short: None },
+            Some(o) => {
+                if o.image.is_none() {
+                    o.image = image;
+                }
+            }
+            None => all.push(Outgrow { pid: self.pid, image, stay32, ns: Arc::clone(self.vfs.view()), clock: self.clock, short: None }),
+        }
     }
 
     /// Read one range of a file into `out`, returning bytes filled; the rest
@@ -10029,6 +10234,7 @@ impl Kernel {
             tid: self.tid,
             exe_path: self.exe_path.clone(),
             exec_mem64: None,
+            exec_image: self.exec_image.clone(),
             argv: self.argv.clone(),
             envp: self.envp.clone(),
             // The child's own ids from here on: a set in either is not the
@@ -10510,6 +10716,13 @@ impl Kernel {
             Ok(Err(Errno::EAGAIN)) if matches!(n, nr::READ | nr::READV) && self.fd_io().polling_read(a[0]) => Ok(Ok(0)),
             o => o,
         };
+        // A mapping the lowered memory had no room for.
+        if matches!(outcome, Ok(Err(Errno::ENOMEM))) && matches!(n, nr::MMAP | nr::MREMAP) {
+            let len = self.mem.lock().take_short();
+            if len != 0 {
+                self.note_short(len);
+            }
+        }
         if let Ok(Err(Errno::EAGAIN)) = &outcome {
             if let Some(op) = self.eagain_park(m, n, a) {
                 self.write_blocked = matches!(op, BlockOp::WriteStream { .. });
