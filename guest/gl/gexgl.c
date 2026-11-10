@@ -4557,6 +4557,24 @@ unsigned eglDestroySurface(void *dpy, void *surface) {
        process has gone. */
     CMD1(GEXGL_SURFACE_DETACH, s->handle);
     flush();
+    /* A Wayland surface's compositor is told too, unless another EGL surface
+       still draws for the same wl_surface: from here the client may attach
+       buffers of its own to it, and ids are reused -- a surface made later
+       with this id must not inherit this one's size and host frames. (A Qt
+       dialog came up 1 pixel high: its wl_surface had the id of a GL probe
+       window's, which had been drawn on the host at 133x1.) */
+    if (s->kind == GEXGL_SURFACE_WAYLAND) {
+        int shared = 0;
+        for (unsigned i = 0; i < GEXGL_MAX_SURFACES; i++)
+            if (&egl_surfaces[i] != s && egl_surfaces[i].handle &&
+                egl_surfaces[i].kind == GEXGL_SURFACE_WAYLAND &&
+                egl_surfaces[i].id == s->id)
+                shared = 1;
+        if (!shared) {
+            unsigned args[4] = { GEXGL_SURFACE_WAYLAND, s->id, 0, 0 };
+            ioctl(gl_fd, GEXGL_SURFACE, args);
+        }
+    }
     if (egl_surface == s) egl_surface = NULL;
     *s = (struct gexgl_egl_surface){ .kind = -1 };
     return EGL_TRUE;
