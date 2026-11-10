@@ -783,8 +783,10 @@ export async function makeProcessHost({
  *  WebSocket in the guest's own Worker delivers on that Worker's event loop,
  *  which a wasm32 program waiting in a syscall never gives back. */
 export async function openNet(network) {
-  if (!network || !globalThis.crossOriginIsolated) return null;
-  const { makeNetChannel, serveNet } = await import('@gex/net-bridge.mjs');
+  // shared memory: an isolated page's, or the Node test host's (which has
+  // no crossOriginIsolated)
+  if (!network || typeof SharedArrayBuffer !== 'function' || globalThis.crossOriginIsolated === false) return null;
+  const { makeNetChannel, serveNet } = await import('../../hosts/browser/js/net-bridge.mjs');
   const channel = makeNetChannel();
   if (channel) serveNet(network, channel);
   return channel;

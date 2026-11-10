@@ -1,0 +1,55 @@
+<!doctype html>
+<!-- debdemo's slim image installing from its repository on this page's origin
+     (repo-network.mjs). Served cross-origin isolated, beside:
+       runtime/               the @gex/runtime package (page/runtime/build.sh)
+       debian-slim.tar.zst    the image, built with REPO_URL=http://gex-repo/
+       repo/                  gex-repo.tar, unpacked
+     ?pkg=NAME installs NAME (default xcvt); ?wisp=wss://... reaches the
+     rest of the internet (Debian's archive) through a Wisp proxy. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Slim apt</title>
+<script type="importmap">
+{ "imports": { "@gex/runtime": "./runtime/index.mjs", "@gex/runtime/": "./runtime/" } }
+</script>
+<style>
+  body { margin: 0; padding: 16px; font: 14px/1.4 ui-monospace, monospace; background: #fff; color: #111; }
+  @media (prefers-color-scheme: dark) { body { background: #111; color: #eee; } }
+  pre { white-space: pre-wrap; margin: 0; }
+</style>
+</head>
+<body>
+<pre id="out"></pre>
+<script type="module">
+import { System } from '@gex/runtime';
+import { MemoryFilesystem } from '@gex/runtime/fs.mjs';
+import { RepoNetwork } from './repo-network.mjs';
+
+const q = new URLSearchParams(location.search);
+const pkg = q.get('pkg') || 'xcvt';
+const out = document.getElementById('out');
+const say = (s) => { out.textContent += s; };
+
+const sys = new System();
+const fs = new MemoryFilesystem(sys);
+fs.addTar(new URL('debian-slim.tar.zst', location.href).href);
+let fallback = null;
+if (q.get('wisp')) {
+  const { Wisp } = await import('@gex/runtime/net-wisp.mjs');
+  fallback = new Wisp(q.get('wisp'));
+}
+sys.network = new RepoNetwork({ base: new URL('repo/', location.href), fallback });
+say('booting\n');
+await sys.boot();
+await sys.spawn(['/etc/gex/boot'], { detached: true }).exited;
+const env = { PATH: '/usr/sbin:/usr/bin:/sbin:/bin', HOME: '/root', DEBIAN_FRONTEND: 'noninteractive' };
+const p = sys.spawn(['sh', '-c', `apt-get update && apt-get install -y ${pkg}`], { env });
+const dec = new TextDecoder();
+const pump = async (s) => { for await (const b of s) say(dec.decode(b, { stream: true })); };
+await Promise.all([pump(p.stdout), pump(p.stderr)]);
+say(`\nexit ${(await p.exited).code}\n`);
+</script>
+</body>
+</html>
