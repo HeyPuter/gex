@@ -641,7 +641,24 @@ def archive_deps(path):
     if a < 0:
         return []
     b = data.find(b'\nGEXCC-END', a)
-    return data[a + 11:b].decode().split('\n') if b > 0 else []
+    if b < 0:
+        return []
+    # (as the writer records them: `=` the sysroot, a relative path the
+    # archive's own directory; one moved with its package since, an
+    # archive found by name)
+    base, out = os.path.dirname(os.path.abspath(path)), []
+    for d in data[a + 11:b].decode().split('\n'):
+        flag = '-L' if d.startswith('-L') else ''
+        v = d[len(flag):]
+        if v.startswith('='):
+            v = SYSROOT + v[1:]
+        elif v and not v.startswith(('/', '-')):
+            v = os.path.normpath(os.path.join(base, v))
+            m = re.match(r'lib(.+)\.(a|so)$', os.path.basename(v))
+            if not flag and not os.path.exists(v) and m:
+                v = '-l' + m.group(1)
+        out.append(flag + v)
+    return out
 
 
 def ld_script_inputs(path):
@@ -1376,6 +1393,19 @@ if shared:
             members.append(it)
     # the -L directories, so the program's link finds the -l names
     deps = ['-L' + os.path.abspath(d) for d in libdirs] + deps
+    # and no path of the build machine: the sysroot's as `=`, the rest
+    # relative to this archive (archive_deps reads them back)
+    root, here = os.path.abspath(SYSROOT), os.path.dirname(os.path.abspath(out))
+
+    def portable(d):
+        flag = '-L' if d.startswith('-L') else ''
+        v = d[len(flag):]
+        if not v.startswith('/'):
+            return d
+        if v == root or v.startswith(root + '/'):
+            return flag + '=' + v[len(root):]
+        return flag + os.path.relpath(v, here)
+    deps = [portable(d) for d in deps]
     # the deps go in a custom section of an empty wasm object (wasm-ld
     # reads every member; it never pulls this one, which defines nothing)
     tmpd = os.path.join(tmp, 'deps')
