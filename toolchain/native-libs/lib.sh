@@ -17,6 +17,13 @@ lib_setup() {
     RT_SRCS="a64call.c rt.c"
     LIBS=
   fi
+  # no path of the build machine's in the library (an assert's __FILE__):
+  # the output directory and each library's source tree by names of their own
+  CF="$CF -ffile-prefix-map=$(realpath -m "$o")=."
+  local s
+  for s in "${ZLIB_SRC:-}" "${ZSTD_SRC:-}" "${SQLITE_SRC:-}"; do
+    [ -n "$s" ] && CF="$CF -ffile-prefix-map=$(realpath -m "$s")=src"
+  done
   RT_OBJS=
   for f in $RT_SRCS; do
     clang $CF -I"$h" -c "$h/$f" -o "$o/rt_${f%.c}.o" &

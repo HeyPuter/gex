@@ -16,7 +16,7 @@
 // sources the build scripts take, ZLIB_SRC, ZSTD_SRC and SQLITE_SRC; A64_SYSROOT
 // (the LP64 libc, toolchain/native-libs/sysroot.sh), else built here from
 // MUSL_SRC and GEX_CRT_SRC.
-import { existsSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { exec, native, tail, count, ROOT } from '../lib/native.mjs';
 
@@ -46,6 +46,12 @@ export default async function (t) {
   for (const b of ['build.sh', 'build-zstd.sh', 'build-sqlite.sh']) {
     const r = await exec([join(I3, b), O], { cwd: d, env: benv, timeout: 1800000 });
     if (!t.check(b, r.code === 0, tail(r.stdout + r.stderr))) return;
+  }
+  // and no library names a path of this machine's (an assert's __FILE__)
+  for (const l of LIBS) {
+    const bytes = readFileSync(join(O, `${l}.wasm`)).toString('latin1');
+    const at = [d, env.ZLIB_SRC, env.ZSTD_SRC, env.SQLITE_SRC].filter(Boolean).find((p) => bytes.includes(p));
+    t.check(`${l}: names no build path`, !at, at);
   }
   mkdirSync(join(d, 'tmp'));
   const fx = (f) => n.src(`native-libs/${f}`);
