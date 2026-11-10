@@ -1606,7 +1606,8 @@ impl FdIo<'_> {
         let name = String::from_utf8_lossy(&raw).into_owned();
         let memfd = Arc::new(unix::MemFd::new(&name));
         let handle: Arc<dyn crate::vfs::FileHandle> = memfd;
-        let file = OpenFile::new(handle, format!("/memfd:{name}"), 0, true, true);
+        // read-write, as F_GETFL says (and as a fork's child rebuilds it)
+        let file = OpenFile::new(handle, format!("/memfd:{name}"), crate::fs::oflags::O_RDWR, true, true);
         self.fds.insert(file, flags & MFD_CLOEXEC != 0)
     }
     /// `fallocate`. Only mode zero, which is "make sure these bytes exist".

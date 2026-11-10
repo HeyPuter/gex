@@ -10086,6 +10086,17 @@ pub extern "C" fn gex_set_child_exe(ptr: u32, len: u32) {
 /// mmap of the same file and written over the file at its exit.
 pub(crate) fn stage_fork_fds(h: &Host, child: i32, maps: bool) {
     let mut out = String::new();
+    // A memfd this process maps shared that is not shared yet: its
+    // mappings' stores written into it first, so that what moves to the
+    // global kernel (`carry_name`) is what the mappings hold.
+    if maps {
+        let unshared = h.kernel.mem.lock().log.shared_maps.iter().any(|s| {
+            Arc::clone(&s.file.handle).as_memfd().is_some_and(|m| m.backing().is_none())
+        });
+        if unshared {
+            h.kernel.map_io().flush_all_shared(&guest());
+        }
+    }
     for (fd, file, cloexec) in h.kernel.fds.entries() {
         let Some(name) = carry_name(&file, child) else {
             continue;
@@ -10134,6 +10145,19 @@ fn carry_name(file: &gex_kernel::file::OpenFile, holder: i32) -> Option<String> 
         pty_note("hands on", id, master as i32, holder);
         return Some(file.path.clone());
     }
+    // A memfd going to a fork's child: its bytes move into the global
+    // kernel first, so the two processes share one file (and their shared
+    // mappings of it meet as any file's do); then it goes by id, below.
+    if holder >= 0 {
+        if let Some(memfd) = Arc::clone(&file.handle).as_memfd() {
+            if memfd.backing().is_none() {
+                if let Err(e) = share_memfd(&memfd) {
+                    warn_line(&format!("gex: could not share {} with a child: {e}\n", file.path));
+                    return None;
+                }
+            }
+        }
+    }
     if let Some(id) = file.handle.remote_id() {
         let dup = unsafe { k_fs_dup(id) };
         if dup < 0 {
@@ -10176,6 +10200,30 @@ fn carry_name(file: &gex_kernel::file::OpenFile, holder: i32) -> Option<String> 
         }
     }
     file.path.starts_with('/').then(|| file.path.clone())
+}
+
+/// Move a memfd's bytes into an unnamed file of the global kernel
+/// ([`gex_kernel::unix::MemFd::back_with`]): made in its `/tmp` and
+/// unlinked at once, so the descriptors are the only way to it.
+fn share_memfd(memfd: &gex_kernel::unix::MemFd) -> Result<(), String> {
+    use gex_kernel::fs::oflags;
+    static SERIAL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let ns = sigs::proc_home().ns();
+    let mut tries = 0;
+    let (path, h) = loop {
+        let n = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = format!("/tmp/.gex-memfd-{}-{n}", my_pid());
+        match ns.open(&path, oflags::O_RDWR | oflags::O_CREAT | oflags::O_EXCL, 0o600) {
+            Err(gex_kernel::errno::Errno::EEXIST) if tries < 256 => tries += 1,
+            Err(e) => return Err(format!("error {}", e.0)),
+            Ok(h) => break (path, h),
+        }
+    };
+    let _ = ns.unlink(&path);
+    if h.remote_id().is_none() {
+        return Err("its /tmp is not the global kernel's".into());
+    }
+    memfd.back_with(h).map_err(|e| format!("error {}", e.0))
 }
 
 thread_local! {
@@ -10357,8 +10405,13 @@ fn rebuild_carried(
         Some((id.parse::<i32>().ok()?, name))
     }) {
         let root = global_root().ok_or("no global kernel")?;
+        let mut handle = gex_kernel::vfs::remote::adopt(root.remote(), id);
+        // a memfd its sender shared (`share_memfd`): a memfd here too
+        if let Some(n) = name.strip_prefix("/memfd:") {
+            handle = Arc::new(gex_kernel::unix::MemFd::backed(n, handle));
+        }
         let f = OpenFile::new(
-            gex_kernel::vfs::remote::adopt(root.remote(), id),
+            handle,
             name.to_string(),
             flags,
             acc != oflags::O_WRONLY,

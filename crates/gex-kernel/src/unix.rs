@@ -1372,10 +1372,18 @@ mod tests {
 /// A `MAP_SHARED` mapping is recorded in the kernel's shared-map list so the
 /// compositor can read the pixels out of guest memory with no copy. The `Vec`
 /// is what `read`/`write`/`ftruncate` see before such a mapping exists.
+///
+/// Its bytes are this module's until another process must share them: a
+/// host whose processes have separate kernels (the page's) moves them into
+/// a file of the global kernel first ([`MemFd::back_with`]), and from then
+/// on every process holding it reads and writes that file, and their
+/// shared mappings of it meet as any shared file's do.
 #[derive(Debug, Default)]
 pub struct MemFd {
     pub name: String,
     data: Mutex<Vec<u8>>,
+    /// The file holding the bytes once they are shared, else unset.
+    backing: std::sync::OnceLock<Arc<dyn FileHandle>>,
     /// Seals applied with `F_ADD_SEALS`, enforced rather than recorded:
     /// Xwayland seals shared memory against shrinking so the compositor cannot
     /// read off the end, and an ignored seal hands back the guarantee without
@@ -1399,8 +1407,43 @@ impl MemFd {
         MemFd {
             name: name.to_string(),
             data: Mutex::new(Vec::new()),
+            backing: std::sync::OnceLock::new(),
             seals: Mutex::new(0),
         }
+    }
+
+    /// A memfd whose bytes are `file`'s (one another process shared): what
+    /// a child rebuilds its parent's from.
+    pub fn backed(name: &str, file: Arc<dyn FileHandle>) -> MemFd {
+        let m = MemFd::new(name);
+        let _ = m.backing.set(file);
+        m
+    }
+
+    /// The file holding the bytes, once they are shared.
+    pub fn backing(&self) -> Option<&Arc<dyn FileHandle>> {
+        self.backing.get()
+    }
+
+    /// Move the bytes into `file` (empty, writable), which holds them from
+    /// now on. Once only: a memfd already shared keeps its file.
+    pub fn back_with(&self, file: Arc<dyn FileHandle>) -> Result<(), Errno> {
+        let mut data = self.data.lock().unwrap();
+        if self.backing.get().is_some() {
+            return Ok(());
+        }
+        file.truncate(data.len() as u64)?;
+        let mut at = 0;
+        while at < data.len() {
+            let n = file.write_at(at as u64, &data[at..])? as usize;
+            if n == 0 {
+                return Err(Errno::EIO);
+            }
+            at += n;
+        }
+        let _ = self.backing.set(file);
+        *data = Vec::new();
+        Ok(())
     }
 
     pub fn seals(&self) -> u32 {
@@ -1425,6 +1468,16 @@ impl MemFd {
     pub fn reserve(&self, upto: u64) -> SysResult {
         let seals = self.seals();
         let mut data = self.data.lock().unwrap();
+        if let Some(b) = self.backing.get() {
+            drop(data);
+            if upto <= b.metadata()?.size {
+                return Ok(0);
+            }
+            if seals & seal::GROW != 0 {
+                return Err(Errno::EPERM);
+            }
+            return b.truncate(upto).map(|_| 0);
+        }
         if (upto as usize) <= data.len() {
             return Ok(0);
         }
@@ -1436,7 +1489,14 @@ impl MemFd {
     }
 
     pub fn len(&self) -> u64 {
-        self.data.lock().unwrap().len() as u64
+        let data = self.data.lock().unwrap();
+        match self.backing.get() {
+            Some(b) => {
+                drop(data);
+                b.metadata().map_or(0, |m| m.size)
+            }
+            None => data.len() as u64,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1451,6 +1511,10 @@ impl FileHandle for MemFd {
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> SysResult {
         let data = self.data.lock().unwrap();
+        if let Some(b) = self.backing.get() {
+            drop(data);
+            return b.read_at(offset, buf);
+        }
         let start = (offset as usize).min(data.len());
         let n = buf.len().min(data.len() - start);
         buf[..n].copy_from_slice(&data[start..start + n]);
@@ -1463,6 +1527,13 @@ impl FileHandle for MemFd {
             return Err(Errno::EPERM);
         }
         let mut data = self.data.lock().unwrap();
+        if let Some(b) = self.backing.get() {
+            drop(data);
+            if seals & seal::GROW != 0 && offset + buf.len() as u64 > b.metadata()?.size {
+                return Err(Errno::EPERM);
+            }
+            return b.write_at(offset, buf);
+        }
         let start = offset as usize;
         if start + buf.len() > data.len() {
             if seals & seal::GROW != 0 {
@@ -1477,6 +1548,14 @@ impl FileHandle for MemFd {
     fn truncate(&self, len: u64) -> Result<(), Errno> {
         let seals = self.seals();
         let mut data = self.data.lock().unwrap();
+        if let Some(b) = self.backing.get() {
+            drop(data);
+            let had = b.metadata()?.size;
+            if (len < had && seals & seal::SHRINK != 0) || (len > had && seals & seal::GROW != 0) {
+                return Err(Errno::EPERM);
+            }
+            return b.truncate(len);
+        }
         let len = len as usize;
         if len < data.len() && seals & seal::SHRINK != 0 {
             return Err(Errno::EPERM);
@@ -1488,7 +1567,26 @@ impl FileHandle for MemFd {
         Ok(())
     }
 
+    /// Once shared, the file's: its count is what other processes'
+    /// mappings of it catch up by.
+    fn changes(&self) -> u64 {
+        self.backing.get().map_or(0, |b| b.changes())
+    }
+
+    fn metadata_changes(&self) -> Result<(Metadata, u64), Errno> {
+        Ok((self.metadata()?, self.changes()))
+    }
+
+    fn remote_id(&self) -> Option<i32> {
+        self.backing.get().and_then(|b| b.remote_id())
+    }
+
     fn metadata(&self) -> Result<Metadata, Errno> {
+        // once shared, the file's (its inode is what tells two processes'
+        // descriptions of it for one file)
+        if let Some(b) = self.backing.get() {
+            return Ok(Metadata { mode: 0o600, ..b.metadata()? });
+        }
         Ok(Metadata {
             file_type: FileType::Regular,
             size: self.len(),
