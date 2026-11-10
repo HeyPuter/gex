@@ -1,4 +1,5 @@
 import { requestGexDevice, textureCanvas, gpuLive } from './gpu-device.js';
+import { XGlReadback } from './xgl.js';
 // gex-wayland's output: a real compositor, in a worker, on WebGPU (the device Mesa uses).
 //
 // Every guest process publishes descriptors for its surfaces into a shared
@@ -2021,6 +2022,7 @@ function loop() {
     // client that swapped once would wait for ever.
     glTick++;
     glDevice?.display?.();
+    xglTick();
     comp.frame();
   } catch (e) {
     post({ kind: 'error', error: e?.stack || String(e) });
@@ -2124,6 +2126,22 @@ function glFrame() {
   return { tex, w: tex.width, h: tex.height, serial: glDevice?.presentedCount?.() ?? 0 };
 }
 
+/* A rootful X server's buffers (xgl.js), and the readback that fills them:
+ * there no window of the scene is an X window, and a GL X client's frame goes
+ * into the window's own pixels on the X screen instead. */
+let xgl = null;
+let xglBack = null;
+// The scene's device (the one Mesa presents on) and the Wayland channel.
+let sceneGpu = null;
+let sceneChannel = null;
+
+function xglTick() {
+  if (!xgl || !glDevice?.ok || !sceneGpu || !sceneChannel) return;
+  xglBack ??= new XGlReadback(xgl, sceneChannel);
+  const a = glAttachment();
+  xglBack.tick(sceneGpu, glFrame(), a?.kind === 1 ? a.id >>> 0 : 0);
+}
+
 async function startGl(m, canvas) {
   // Mesa presents into a canvas of its own whose 'webgpu' context is a
   // texture on the compositor's device: its frames are drawn into the scene
@@ -2219,6 +2237,8 @@ const onMessage = ({ data: m }) => {
       // The compositor draws with WebGPU on the device Mesa will use.
       if (m.glLimits != null) globalThis.GEX_GL_LIMITS = m.glLimits;
       requestGexDevice().then((gpu) => {
+        sceneGpu = gpu.device;
+        sceneChannel = m.channel;
         comp = new Compositor(canvas, m.channel, m.stats ? new Int32Array(m.stats) : null, gpu);
         comp.setDirect(m.direct);
         if (wallpaper) comp.setWallpaper(wallpaper.bitmap, wallpaper.anchor);
@@ -2236,6 +2256,8 @@ const onMessage = ({ data: m }) => {
       // other windows.
       startGl(m, canvas).catch((e) =>
         post({ kind: 'gl-failed', error: e?.message || String(e) }));
+    } else if (m.kind === 'x-gl') {
+      xgl = { ctl: m.ctl, pix: m.pix };
     } else if (m.kind === 'memory') {
       comp?.addMemory(m.token, m.memory, m.kernel);
     } else if (m.kind === 'pixels') {
@@ -2276,7 +2298,11 @@ const onMessage = ({ data: m }) => {
     } else if (m.kind === 'window-at') {
       post({ kind: 'window-at', id: m.id, state: comp?.windowAt(m.x, m.y) ?? null });
     } else if (m.kind === 'describe') {
-      Promise.resolve(comp?.describe({ pixels: m.pixels !== false }) ?? null).then((state) => post({ kind: 'describe', id: m.id, state }));
+      Promise.resolve(comp?.describe({ pixels: m.pixels !== false }) ?? null).then((state) => post({
+        kind: 'describe', id: m.id,
+        // And the GL frames read back for a rootful X server, for a test.
+        state: state && xglBack ? { ...state, xgl: { ...xglBack.stats } } : state,
+      }));
     } else if (m.kind === 'stop') {
       running = false;
     }

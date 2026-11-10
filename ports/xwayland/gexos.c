@@ -508,12 +508,22 @@ gex_sendmsg(int fd, const struct msghdr *msg, int flags)
  * word. The tick before the wait is where the compositor's side of the frame
  * happens -- see `gexjs_tick`.
  */
+/* gexgl.c: a GL frame put into its X window, between two turns of the main
+ * loop. Not from a Wayland round trip's wait (`gex_ppoll`), which can be in
+ * the middle of a request. */
+int gex_xgl_service(void);
+static int in_ppoll;
+
 int
 gex_poll(struct pollfd *fds, nfds_t nfds, int timeout)
 {
     long long deadline_slept = 0;
     for (;;) {
         gexjs_tick();
+        /* A frame put: back to the loop, whose block handler posts its
+         * damage, as a request's drawing would be. */
+        if (!in_ppoll && gex_xgl_service())
+            return 0;
         int ready = 0;
         for (nfds_t i = 0; i < nfds; i++) {
             fds[i].revents = 0;
@@ -576,7 +586,10 @@ gex_ppoll(struct pollfd *fds, nfds_t nfds, const struct timespec *timeout,
                         + timeout->tv_nsec / 1000000;
         ms = total > 2147483647LL ? 2147483647 : (int) total;
     }
-    return gex_poll(fds, nfds, ms);
+    in_ppoll++;
+    int r = gex_poll(fds, nfds, ms);
+    in_ppoll--;
+    return r;
 }
 
 /* -- pools of pixels ------------------------------------------------------- */

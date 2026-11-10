@@ -510,6 +510,7 @@ export async function startXServer({ kernel, wlChannel, compositor, term, rootfu
     } else if (m.kind === 'win') console.log(`[win] ${m.text}`);
     else if (m.kind === 'wl-memory') compositor()?.addMemory(m.token, m.memory, m.kernel);
     else if (m.kind === 'wl-pixels') compositor()?.addPixels?.(m.token, m.id, m.buffer, m.replaces);
+    else if (m.kind === 'x-gl') compositor()?.addXGl?.(m.ctl, m.pix);
     else if (m.kind === 'ready') listening(true);
     else if (m.kind === 'failed') {
       term.writeln(`gex: the X server failed: ${m.why}`);

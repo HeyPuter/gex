@@ -620,6 +620,11 @@ export function sendEvent(channel, block, kind, a1 = 0, b1 = 0, c1 = 0, d1 = 0, 
   wakeBlock(channel, a, block);
 }
 
+/** Wake the process that holds `block`, as an event for it would. */
+export function wakeProcess(channel, block) {
+  wakeBlock(channel, new Int32Array(channel.arena), block);
+}
+
 /** Notify the wait queue of the process that holds `block`. */
 function wakeBlock(channel, a, block) {
   const q = Atomics.load(a, blockBase(block) + B_WAKE);
@@ -997,6 +1002,11 @@ export class WlProxy {
 
   get token() {
     return this.#token;
+  }
+
+  /** This process's block of the arena, or -1. */
+  get block() {
+    return this.#block;
   }
 
   /** Whether this process got a block at all. */
