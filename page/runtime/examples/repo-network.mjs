@@ -13,7 +13,11 @@
 // connection (apt pipelines them) answered in their order; If-Modified-Since,
 // If-None-Match, Range and If-Range passed on to the fetch, and its 304 or
 // 206 passed back; Content-Length when the fetch has one for the bytes it
-// gives (not when it decoded a Content-Encoding), chunked otherwise.
+// gives (not when it decoded a Content-Encoding), chunked otherwise. An HTML
+// answer for a path not ending in .html is a 404: a Debian repository serves
+// no HTML, and a static server's fallback page (an SPA's or a dev server's
+// index.html for every unknown path) in place of a missing InRelease would
+// make apt fail its signature check rather than fall back to Release.
 
 const enc = new TextEncoder();
 const dec = new TextDecoder('latin1');
@@ -103,6 +107,10 @@ export class RepoNetwork {
     for (const h of PASSED_ON) if (req.headers[h]) headers[h] = req.headers[h];
     try {
       const r = await this.fetch(url, { method: req.method, headers, cache: 'no-store' });
+      if (r.ok && /^text\/html\b/i.test(r.headers.get('content-type') || '') && !/\.html?$/i.test(url.pathname)) {
+        r.body?.cancel().catch(() => {});
+        return { status: 404, headers: new Headers(), body: null };
+      }
       return { status: r.status, headers: r.headers, body: req.method === 'HEAD' ? null : r.body };
     } catch {
       return { status: 502, headers: new Headers(), body: null };

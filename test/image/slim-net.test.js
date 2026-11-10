@@ -23,7 +23,9 @@ const dec = new TextDecoder('latin1');
 /** The repository as a static server: Last-Modified and If-Modified-Since,
  *  and /gz/PATH as PATH gzip-encoded with no length. `dated.at` (seconds),
  *  once set: every file's time, as gex-repo.tar unpacked gives them (the
- *  build's time, the image's lists' too). */
+ *  build's time, the image's lists' too). `dated.spa`, once set: an unknown
+ *  path answered 200 with an index.html, as an SPA's or a dev server's
+ *  static server does. */
 function serve(root, log, dated = {}) {
   const server = createServer((req, res) => {
     let path = decodeURIComponent(new URL(req.url, 'http://x').pathname);
@@ -32,6 +34,11 @@ function serve(root, log, dated = {}) {
     const file = join(root, normalize(path).replace(/^(\.\.[/\\])+/, ''));
     let st;
     try { st = statSync(file); } catch { st = null; }
+    if (!st?.isFile() && dated.spa) {
+      log.push(`html ${path}`);
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }).end('<!doctype html><title>app</title><div id="root"></div>');
+      return;
+    }
     if (!st?.isFile()) { log.push(`404 ${path}`); res.writeHead(404).end(); return; }
     const lm = new Date((dated.at ?? Math.floor(st.mtimeMs / 1000)) * 1000);
     const ims = req.headers['if-modified-since'];
@@ -145,6 +152,14 @@ export default async function (t) {
     eq('apt-get update a third time', (await run(['apt-get', 'update'])).code, 0);
     check('the third update is conditional: the Release 304', log.includes('304 /dists/trixie/Release'), log.join('\n'));
     say(log.join(', '));
+    // A static server whose unknown paths give a 200 index.html: the missing
+    // InRelease is still a 404 to apt, which then takes the Release.
+    dated.spa = true;
+    const spa = await exchange(net, 'GET /dists/trixie/InRelease HTTP/1.1\r\nConnection: close\r\n\r\n');
+    check('an HTML fallback for a repository path: 404', /^HTTP\/1\.1 404 /.test(spa) && !/<html|doctype/i.test(spa), spa.slice(0, 300));
+    log.length = 0;
+    eq('apt-get update behind an HTML fallback', (await run(['apt-get', 'update'])).code, 0);
+    check('the fallback answered InRelease, and apt went on to the Release', log.includes('html /dists/trixie/InRelease') && log.some((l) => / \/dists\/trixie\/Release$/.test(l)), log.join('\n'));
     await sys.shutdown();
   } finally {
     server.close();
