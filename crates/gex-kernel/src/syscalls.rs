@@ -980,7 +980,11 @@ pub fn note_short(pid: i32, len: u64, compat: bool, wasm32: bool) {
 /// which [`Kernel::exec_flavour`] and gexc read at its next start), and its
 /// crash notice says so, or that the record could not be made. A process
 /// that carried on, or exited 0, keeps its memory. Hosts call this as the
-/// process ends, before `procs` hears of it.
+/// process ends, before its descriptors close and before `procs` hears of
+/// it: whatever sees it gone may start it again at once (a Windows parent
+/// learns of a child's end from wineserver, at the close of the child's
+/// connection), and that start must find the record. A second call for
+/// the same process finds nothing.
 pub fn outgrow_ending(pid: i32, status: i32, procs: &crate::proc::ProcTable) {
     let Some(host) = OUTGROW_HOST.get() else { return };
     let rec = {

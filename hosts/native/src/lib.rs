@@ -1562,6 +1562,11 @@ fn run_program_with(
             // for it for ever).
             stop_other_threads(&spawn, false);
             let mut k = spawn.kernel.lock().unwrap_or_else(|e| e.into_inner());
+            // its memory record before anything can see it gone
+            // (`outgrow_ending`)
+            if program_failed(&e) {
+                gex_kernel::syscalls::outgrow_ending(k.pid, signal::SIGSEGV as i32, &k.procs);
+            }
             k.fds.close_all();
             // A trap or a Wasm exception is the program's crash, not
             // gexc's: it ends as one that a signal ended (SIGSEGV), and its
@@ -2516,11 +2521,9 @@ fn guest_thread_body(cx: Arc<SpawnContext>, child: ThreadState) {
                 detail: format!("thread {} failed: {e:#}", child.tid),
                 internal: true,
             });
-            cx.kernel
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .fds
-                .close_all();
+            let mut k = cx.kernel.lock().unwrap_or_else(|e| e.into_inner());
+            gex_kernel::syscalls::outgrow_ending(k.pid, signal::SIGSEGV as i32, &k.procs);
+            k.fds.close_all();
         }
         // `exit_group` or a fatal signal on this thread: the process
         // ends with it, and the first thread, parked in a futex
@@ -2931,6 +2934,7 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
                     if let Some(cx) = cleanup.upgrade() {
                         stop_other_threads(&cx, false);
                     }
+                    gex_kernel::syscalls::outgrow_ending(pid, 127 << 8, &procs);
                     kernel
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
@@ -2957,15 +2961,16 @@ fn fork_process(store: &impl wasmtime::AsContext<Data = HostState>, req: ForkReq
             // the kernel's encoding: handing it `code` and correcting the cell
             // afterwards let a parent parked in `wait4` read `exit 7` as a
             // death by signal 7 ("Bus error") in between.
+            // Whether it outgrew its memory, before anything can see it gone
+            // (one that exec'd was looked at as its program ended,
+            // `report_first_end`).
+            gex_kernel::syscalls::outgrow_ending(pid, wstatus, &procs);
             // Its descriptors close before its parent can see it gone, as on
             // Linux: a listening socket's port is free once `wait4` returns.
             {
                 let mut k = kernel.lock().unwrap_or_else(|e| e.into_inner());
                 k.fds.close_all();
             }
-            // Whether it outgrew its memory (one that exec'd was looked at
-            // as its program ended, `report_first_end`).
-            gex_kernel::syscalls::outgrow_ending(pid, wstatus, &procs);
             procs.exit(pid, wstatus);
             usage::forget(pid);
             let (st, done) = status;
