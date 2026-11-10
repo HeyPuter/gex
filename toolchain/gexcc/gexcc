@@ -690,12 +690,94 @@ def expand(items, seen):
             res += sub
             missing += miss
             continue
+        if it.endswith('.rlib'):
+            res += rlib_ctors(it)
         res.append(it)
         if is_archive(it):
             sub, miss = expand(archive_deps(it), seen)
             res += sub
             missing += miss
     return res, missing
+
+
+def _ar_members(data):
+    """An ar archive's members, (name, bytes): GNU names (the // table) and
+    BSD ones (#1/LEN)."""
+    pos, longnames = 8, b''
+    while pos + 60 <= len(data):
+        h = data[pos:pos + 60]
+        name, size = h[:16].rstrip(b' '), int(h[48:58].strip() or 0)
+        body = data[pos + 60:pos + 60 + size]
+        pos += 60 + size + (size & 1)
+        if name == b'//':
+            longnames = body
+            continue
+        if name in (b'/', b'/SYM64/', b'__.SYMDEF', b'__.SYMDEF SORTED'):
+            continue
+        if name.startswith(b'#1/'):
+            n = int(name[3:])
+            name, body = body[:n].rstrip(b'\0'), body[n:]
+        elif name.startswith(b'/') and name[1:].isdigit():
+            off = int(name[1:])
+            name = longnames[off:longnames.index(b'/\n', off)]
+        else:
+            name = name.rstrip(b'/')
+        yield name.decode(errors='replace'), body
+
+
+def _has_init_funcs(obj):
+    """Whether a wasm object lists constructors (its linking section's
+    WASM_INIT_FUNCS)."""
+    if not obj.startswith(b'\0asm'):
+        return False
+    def uleb(i):
+        r = sh = 0
+        while True:
+            b = obj[i]; i += 1
+            r |= (b & 0x7f) << sh; sh += 7
+            if b < 0x80:
+                return r, i
+    i = 8
+    while i < len(obj):
+        sid = obj[i]
+        n, i = uleb(i + 1)
+        end = i + n
+        if sid == 0:
+            ln, j = uleb(i)
+            if obj[j:j + ln] == b'linking':
+                j += ln
+                _, j = uleb(j)  # version
+                while j < end:
+                    kind = obj[j]
+                    sz, j = uleb(j + 1)
+                    if kind == 6:
+                        return uleb(j)[0] > 0
+                    j += sz
+                return False
+        i = end
+    return False
+
+
+def rlib_ctors(path):
+    """A Rust rlib's members that have constructors, as objects to link
+    whole. rustc's ELF links pull every #[used] static (an inventory or
+    ctor crate's .init_array entry) through a symbols.o of references, which
+    it does not write for wasm: without this a crate's registration that
+    nothing else in its object refers to is not linked. C and C++ archives
+    keep the archive rule."""
+    try:
+        data = open(path, 'rb').read()
+    except OSError:
+        return []
+    if not data.startswith(AR_MAGIC):
+        return []
+    out = []
+    for k, (name, body) in enumerate(_ar_members(data)):
+        if name.endswith('.o') and _has_init_funcs(body):
+            o = os.path.join(tmp, 'rlib-%d-%s-%s' % (len(os.listdir(tmp)), k, os.path.basename(name)))
+            open(o, 'wb').write(body)
+            out.append(o)
+    return out
 
 
 def imports(path):
