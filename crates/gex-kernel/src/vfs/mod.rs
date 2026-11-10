@@ -532,6 +532,13 @@ pub trait FileHandle: Send + Sync + std::fmt::Debug {
     /// needs it, hence the default.
     fn claim_session(&self, _sid: i32) {}
 
+    /// The pts number of a pseudoterminal's master: what `TIOCGPTPEER`
+    /// opens the slave of. The syscall layer opens it, as only it installs
+    /// descriptors. `None` for anything else.
+    fn pty_peer(&self) -> Option<i32> {
+        None
+    }
+
     /// Whether another *process* is what ends a wait on this handle, rather
     /// than the host.
     ///

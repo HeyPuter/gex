@@ -434,6 +434,10 @@ impl crate::vfs::FileHandle for RemotePty {
         Some((self.remote.available)(self.id, self.m()).max(0) as u64)
     }
 
+    fn pty_peer(&self) -> Option<i32> {
+        if self.master { Some((self.remote.ptn)(self.id)) } else { None }
+    }
+
     fn claim_session(&self, sid: i32) {
         // What `TIOCSCTTY` means for a pty that lives in the global kernel.
         //
@@ -697,10 +701,10 @@ impl RemotePty {
                 m.write_u32(arg, 0)?;
                 Ok(0)
             }
-            // Opening the peer without a path: the syscall layer must install a
-            // new descriptor, which a handle cannot do, so it is refused here and
-            // glibc falls back to opening `/dev/pts/N` by name.
-            ioc::TIOCGPTPEER => Err(Errno::EINVAL),
+            // Opening the peer: the syscall layer installs the descriptor
+            // (`pty_peer`), before this handle is asked; here only for the
+            // slave, which has no peer to open.
+            ioc::TIOCGPTPEER => Err(Errno::ENOTTY),
             // The descriptor-level ioctls (FIOCLEX, FIONBIO, ...) are the same
             // for any file; let the kernel's own handling take them.
             _ => Err(Errno::ENOTTY),
