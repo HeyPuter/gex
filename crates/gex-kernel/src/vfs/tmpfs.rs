@@ -608,7 +608,26 @@ pub fn set_clock(clock: crate::syscalls::ClockFn) {
     let _ = CLOCK.set(clock);
 }
 
+thread_local! {
+    /// The time of the call this thread is serving for another module
+    /// ([`at_time`]), or `i64::MIN` when none.
+    static CALL_NOW: core::cell::Cell<i64> = const { core::cell::Cell::new(i64::MIN) };
+}
+
+/// Run `f` with `now` as the time every tmpfs stamps: a module with no clock
+/// of its own serving a call that brought the caller's.
+pub fn at_time<R>(now: i64, f: impl FnOnce() -> R) -> R {
+    let was = CALL_NOW.with(|c| c.replace(now));
+    let r = f();
+    CALL_NOW.with(|c| c.set(was));
+    r
+}
+
 pub(crate) fn now() -> i64 {
+    let call = CALL_NOW.try_with(|c| c.get()).unwrap_or(i64::MIN);
+    if call != i64::MIN {
+        return call;
+    }
     (CLOCK.get().copied().unwrap_or(crate::syscalls::system_clock))().0 as i64
 }
 
@@ -794,7 +813,13 @@ impl Inner {
     /// An entry of `path`'s directory was made or removed by a program: the
     /// directory's modification time is now, as Linux keeps it (KService
     /// and make compare a directory's time with their own records).
+    ///
+    /// A change with no time (0: a module with no clock, seeding) leaves
+    /// it, so a seeded directory keeps the time its entries give it.
     fn entries_changed(&mut self, path: &str, now: i64) {
+        if now <= 0 {
+            return;
+        }
         let d = path.rfind('/').map_or("", |i| &path[..i]);
         self.mtimes.insert(d.to_string(), now);
         self.inferred.remove(d);

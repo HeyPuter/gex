@@ -33,6 +33,26 @@ export default async function (t) {
   eq('mkdir', made.code, 0);
   const times = [await secs('/tmp/made'), await secs('/tmp/made/sub')];
   check('a program\'s folders are made now', times.every((s) => s >= t0 - 5), JSON.stringify(times));
+  // A name made, moved or removed moves its folder's time: the kernel that
+  // holds the root has no clock, so each change is dated by its caller's.
+  const after = async (cmd) => {
+    const r = await timeout(sys.run(['sh', '-c', `sleep 2 && ${cmd}`], { env }), 30000, cmd);
+    eq(cmd, r.code, 0);
+  };
+  const was = await secs('/tmp/made');
+  await after('touch /tmp/made/f');
+  const added = await secs('/tmp/made');
+  check('a file made moves its folder\'s time', added >= was + 2, `${was} -> ${added}`);
+  await after('mv /tmp/made/f /tmp/made/sub/g');
+  const moved = [await secs('/tmp/made'), await secs('/tmp/made/sub')];
+  check('a rename moves both folders\' times', moved.every((s) => s >= added + 2), `${added} -> ${JSON.stringify(moved)}`);
+  await after('rm /tmp/made/sub/g');
+  const removed = await secs('/tmp/made/sub');
+  check('a file removed moves its folder\'s time', removed >= moved[1] + 2, `${moved[1]} -> ${removed}`);
+  await after('true');
+  await fs.rm('/tmp/made/sub', { recursive: true });
+  const page = await secs('/tmp/made');
+  check('the page\'s rm moves its folder\'s time', page >= moved[0] + 2, `${moved[0]} -> ${page}`);
   // And one the page makes after boot.
   await fs.mkdir('/srv/api/dir', { recursive: true });
   check('the page\'s mkdir is dated now', (await secs('/srv/api/dir')) >= t0 - 5, String(await secs('/srv/api/dir')));

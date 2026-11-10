@@ -527,10 +527,13 @@ extern "C" {
     fn k_fs_walk(path: gex_kernel::PAddr, path_len: u32, mounts: gex_kernel::PAddr, mounts_len: u32, follow: u32, at: gex_kernel::PAddr, cap: u32) -> i32;
     fn k_fs_walk_meta(path: gex_kernel::PAddr, path_len: u32, mounts: gex_kernel::PAddr, mounts_len: u32, at: gex_kernel::PAddr) -> i32;
     fn k_fs_unlink(path: gex_kernel::PAddr, path_len: u32) -> i32;
+    fn k_fs_unlink_now(path: gex_kernel::PAddr, path_len: u32, now: i64) -> i32;
     fn k_fs_mkdir_now(path: gex_kernel::PAddr, path_len: u32, mode: u32, now: i64) -> i32;
     fn k_fs_add_dir(path: gex_kernel::PAddr, path_len: u32, mode: u32) -> i32;
     fn k_fs_rmdir(path: gex_kernel::PAddr, path_len: u32) -> i32;
+    fn k_fs_rmdir_now(path: gex_kernel::PAddr, path_len: u32, now: i64) -> i32;
     fn k_fs_rename(from: gex_kernel::PAddr, from_len: u32, to: gex_kernel::PAddr, to_len: u32, noreplace: u32) -> i32;
+    fn k_fs_rename_now(from: gex_kernel::PAddr, from_len: u32, to: gex_kernel::PAddr, to_len: u32, noreplace: u32, now: i64) -> i32;
     fn k_fs_moved(handle: i32, at: gex_kernel::PAddr, cap: u32) -> i32;
     fn k_fs_hold_renames(handle: i32, owner: i32, on: u32) -> i32;
     fn k_fs_rename_epoch() -> i32;
@@ -541,8 +544,11 @@ extern "C" {
     fn k_fs_set_times_fd(handle: i32, a_s: i64, a_ns: u32, m_s: i64, m_ns: u32, now: i64) -> i32;
     fn k_fs_xattr(handle: i32, path: gex_kernel::PAddr, path_len: u32, op: u32, name: gex_kernel::PAddr, name_len: u32, buf: gex_kernel::PAddr, len: u32, flags: u32) -> i32;
     fn k_fs_symlink(target: gex_kernel::PAddr, target_len: u32, path: gex_kernel::PAddr, path_len: u32) -> i32;
+    fn k_fs_symlink_now(target: gex_kernel::PAddr, target_len: u32, path: gex_kernel::PAddr, path_len: u32, now: i64) -> i32;
     fn k_fs_link(from: gex_kernel::PAddr, from_len: u32, to: gex_kernel::PAddr, to_len: u32) -> i32;
+    fn k_fs_link_now(from: gex_kernel::PAddr, from_len: u32, to: gex_kernel::PAddr, to_len: u32, now: i64) -> i32;
     fn k_fs_mksocket(path: gex_kernel::PAddr, path_len: u32) -> i32;
+    fn k_fs_mksocket_now(path: gex_kernel::PAddr, path_len: u32, now: i64) -> i32;
     fn k_fs_add(path: gex_kernel::PAddr, path_len: u32, at: gex_kernel::PAddr, len: u32) -> i32;
     fn k_fs_add_part(path: gex_kernel::PAddr, path_len: u32, offset: u64, at: gex_kernel::PAddr, len: u32) -> i32;
     fn k_fs_add_lazy(path: gex_kernel::PAddr, path_len: u32, url: gex_kernel::PAddr, url_len: u32, size: u64) -> i32;
@@ -1178,7 +1184,7 @@ extern "C" fn rf_walk_meta(path: gex_kernel::PAddr, path_len: u32, mounts: gex_k
 }
 extern "C" fn rf_unlink(path: gex_kernel::PAddr, path_len: u32) -> i32 {
     gex_kernel::phase::mark(7);
-    let r = unsafe { k_fs_unlink(path, path_len) };
+    let r = unsafe { k_fs_unlink_now(path, path_len, browser_clock().0 as i64) };
     gex_kernel::phase::mark(8);
     r
 }
@@ -1190,13 +1196,13 @@ extern "C" fn rf_mkdir(path: gex_kernel::PAddr, path_len: u32, mode: u32, now: i
 }
 extern "C" fn rf_rmdir(path: gex_kernel::PAddr, path_len: u32) -> i32 {
     gex_kernel::phase::mark(7);
-    let r = unsafe { k_fs_rmdir(path, path_len) };
+    let r = unsafe { k_fs_rmdir_now(path, path_len, browser_clock().0 as i64) };
     gex_kernel::phase::mark(8);
     r
 }
 extern "C" fn rf_rename(from: gex_kernel::PAddr, from_len: u32, to: gex_kernel::PAddr, to_len: u32, noreplace: u32) -> i32 {
     gex_kernel::phase::mark(7);
-    let r = unsafe { k_fs_rename(from, from_len, to, to_len, noreplace) };
+    let r = unsafe { k_fs_rename_now(from, from_len, to, to_len, noreplace, browser_clock().0 as i64) };
     gex_kernel::phase::mark(8);
     r
 }
@@ -1262,19 +1268,19 @@ extern "C" fn rf_xattr(handle: i32, path: gex_kernel::PAddr, path_len: u32, op: 
 }
 extern "C" fn rf_symlink(target: gex_kernel::PAddr, target_len: u32, path: gex_kernel::PAddr, path_len: u32) -> i32 {
     gex_kernel::phase::mark(7);
-    let r = unsafe { k_fs_symlink(target, target_len, path, path_len) };
+    let r = unsafe { k_fs_symlink_now(target, target_len, path, path_len, browser_clock().0 as i64) };
     gex_kernel::phase::mark(8);
     r
 }
 extern "C" fn rf_link(from: gex_kernel::PAddr, from_len: u32, to: gex_kernel::PAddr, to_len: u32) -> i32 {
     gex_kernel::phase::mark(7);
-    let r = unsafe { k_fs_link(from, from_len, to, to_len) };
+    let r = unsafe { k_fs_link_now(from, from_len, to, to_len, browser_clock().0 as i64) };
     gex_kernel::phase::mark(8);
     r
 }
 extern "C" fn rf_mksocket(path: gex_kernel::PAddr, path_len: u32) -> i32 {
     gex_kernel::phase::mark(7);
-    let r = unsafe { k_fs_mksocket(path, path_len) };
+    let r = unsafe { k_fs_mksocket_now(path, path_len, browser_clock().0 as i64) };
     gex_kernel::phase::mark(8);
     r
 }

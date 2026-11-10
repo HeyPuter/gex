@@ -16,6 +16,8 @@ const META_BYTES = 72;
 /** gex-kernel vfs::remote::xattr_op::SET. */
 const XATTR_SET = 1;
 const TYPES = ['file', 'directory', 'symlink', 'chardev', 'fifo', 'socket'];
+/** The time the kernel stamps a change with (it has no clock): seconds. */
+const nowSecs = () => BigInt(Math.trunc(Date.now() / 1000));
 /** The most bytes one batch carries to the Worker. */
 const BATCH_BYTES = 32 << 20;
 
@@ -222,7 +224,7 @@ export class Files {
 
   async mkdir(path, { recursive = false, mode = 0o755 } = {}) {
     // Dated now, as a program's mkdir is (the kernel has no clock).
-    const now = BigInt(Math.trunc(Date.now() / 1000));
+    const now = nowSecs();
     if (!recursive) {
       const r = await this.#k.r('k_fs_mkdir_now', { in: path }, mode, now);
       if (r < 0) throw errno(r, path);
@@ -250,16 +252,16 @@ export class Files {
     }
     if (st.type === 'directory') {
       if (recursive) for (const { name } of await this.readdir(path)) await this.rm(`${path.replace(/\/+$/, '')}/${name}`, { recursive, force });
-      const r = await this.#k.r('k_fs_rmdir', { in: path });
+      const r = await this.#k.r('k_fs_rmdir_now', { in: path }, nowSecs());
       if (r < 0) throw errno(r, path);
       return;
     }
-    const r = await this.#k.r('k_fs_unlink', { in: path });
+    const r = await this.#k.r('k_fs_unlink_now', { in: path }, nowSecs());
     if (r < 0 && !(force && r === -2)) throw errno(r, path);
   }
 
   async rename(from, to) {
-    const r = await this.#k.r('k_fs_rename', { in: from }, { in: to }, 0);
+    const r = await this.#k.r('k_fs_rename_now', { in: from }, { in: to }, 0, nowSecs());
     if (r < 0) throw errno(r, `${from} -> ${to}`);
   }
 

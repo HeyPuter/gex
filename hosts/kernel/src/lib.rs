@@ -3002,10 +3002,10 @@ pub extern "C" fn k_fs_open(path: gex_kmem::PAddr, path_len: u32, flags: u64, mo
 pub extern "C" fn k_fs_open_now(path: gex_kmem::PAddr, path_len: u32, flags: u64, mode: u32, now: i64) -> i32 {
     use gex_kernel::fs::oflags::{O_CREAT, O_TRUNC};
     let p = path_of(path, path_len);
-    let opened = match pagefs::find(&p) {
+    let opened = gex_kernel::vfs::tmpfs::at_time(now, || match pagefs::find(&p) {
         Some((m, rel)) => m.open_mode(&rel, flags, mode),
         None => rootfs().open_mode(&p, flags, mode),
-    };
+    });
     match opened {
         Ok(h) => {
             if flags & (O_CREAT | O_TRUNC) != 0 {
@@ -3508,6 +3508,42 @@ pub extern "C" fn k_fs_mkdir_now(path: gex_kmem::PAddr, path_len: u32, mode: u32
         return as_unit(m.mkdir(&rel, mode));
     }
     as_unit(rootfs().mkdir_now(&p, mode, now))
+}
+
+/// [`k_fs_unlink`] at `now`, the caller's clock: the directory's time.
+#[no_mangle]
+pub extern "C" fn k_fs_unlink_now(path: gex_kmem::PAddr, path_len: u32, now: i64) -> i32 {
+    gex_kernel::vfs::tmpfs::at_time(now, || k_fs_unlink(path, path_len))
+}
+
+/// [`k_fs_rmdir`] at `now`, the caller's clock.
+#[no_mangle]
+pub extern "C" fn k_fs_rmdir_now(path: gex_kmem::PAddr, path_len: u32, now: i64) -> i32 {
+    gex_kernel::vfs::tmpfs::at_time(now, || k_fs_rmdir(path, path_len))
+}
+
+/// [`k_fs_rename`] at `now`, the caller's clock: both directories' times.
+#[no_mangle]
+pub extern "C" fn k_fs_rename_now(from: gex_kmem::PAddr, from_len: u32, to: gex_kmem::PAddr, to_len: u32, noreplace: u32, now: i64) -> i32 {
+    gex_kernel::vfs::tmpfs::at_time(now, || k_fs_rename(from, from_len, to, to_len, noreplace))
+}
+
+/// [`k_fs_symlink`] at `now`, the caller's clock.
+#[no_mangle]
+pub extern "C" fn k_fs_symlink_now(target: gex_kmem::PAddr, target_len: u32, path: gex_kmem::PAddr, path_len: u32, now: i64) -> i32 {
+    gex_kernel::vfs::tmpfs::at_time(now, || k_fs_symlink(target, target_len, path, path_len))
+}
+
+/// [`k_fs_link`] at `now`, the caller's clock.
+#[no_mangle]
+pub extern "C" fn k_fs_link_now(from: gex_kmem::PAddr, from_len: u32, to: gex_kmem::PAddr, to_len: u32, now: i64) -> i32 {
+    gex_kernel::vfs::tmpfs::at_time(now, || k_fs_link(from, from_len, to, to_len))
+}
+
+/// [`k_fs_mksocket`] at `now`, the caller's clock.
+#[no_mangle]
+pub extern "C" fn k_fs_mksocket_now(path: gex_kmem::PAddr, path_len: u32, now: i64) -> i32 {
+    gex_kernel::vfs::tmpfs::at_time(now, || k_fs_mksocket(path, path_len))
 }
 
 /// A directory put into the shared root with every missing one above it
