@@ -1916,13 +1916,8 @@ impl FdIo<'_> {
         };
         // Watching something that is not open is an error, and a program that
         // gets silence instead waits for a readiness that cannot arrive.
-        let file = if op != unix::epoll_op::DEL { Some(self.fds.get(fd)?) } else { None };
-        let source = file.as_ref().map_or(0, |f| f.handle.wait_queue());
-        let r = set.ctl_queue(op, fd, events, data, source)?;
-        if let Some(f) = file {
-            set.note_file(fd, &f.handle, f.writable);
-        }
-        Ok(r)
+        let file = if op != unix::epoll_op::DEL { Some(self.fds.get(fd)?) } else { self.fds.get(fd).ok() };
+        set.ctl_file(op, fd, events, data, file.as_ref().map(|f| (&f.handle, f.writable)))
     }
 
     /// A `readv`'s vectors when there is more than one with room in it,
@@ -2656,19 +2651,32 @@ impl FdIo<'_> {
         )
     }
 
-    /// A set's registrations as the list the poll path understands.
+    /// A set's registrations as the list the poll path understands, each
+    /// asking the open file it is of ([`unix::EpollSet::owner`]), which
+    /// its number may no longer name. A watch whose file is closed is gone.
     fn epoll_pollfds(&self, set: &Arc<unix::EpollSet>) -> Vec<PollFd> {
         set.watches()
             .iter()
             .filter_map(|w| {
-                let file = self.fds.get(w.fd).ok()?;
-                set.note_file(w.fd, &file.handle, file.writable);
+                let (handle, writable) = match set.owner(w.fd) {
+                    Some(Some(owned)) => owned,
+                    Some(None) => {
+                        set.forget(w.fd);
+                        return None;
+                    }
+                    None => {
+                        let file = self.fds.get(w.fd).ok()?;
+                        set.note_file(w.fd, &file.handle, file.writable);
+                        (Arc::clone(&file.handle), file.writable)
+                    }
+                };
+                set.rechain(w.fd, handle.wait_queue());
                 Some(PollFd {
                     addr: 0,
                     fd: w.fd,
                     events: (w.events & 0xffff) as u16,
-                    handle: Some(Arc::clone(&file.handle)),
-                    writable: file.writable,
+                    handle: Some(handle),
+                    writable,
                     epoll: Some(Arc::clone(set)),
                     edge: w.events & unix::epoll_flag::ET != 0,
                 })

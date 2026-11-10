@@ -33,6 +33,7 @@ import { pageHosts } from '../../hosts/browser/js/page-host.mjs';
 import { claimStore, storeBusy } from '../../hosts/browser/js/blocks.mjs';
 import { checkOptions, filesystemValue, sizeValue, showValue } from './start-options.js';
 import { posixTz } from './posix-tz.js';
+import { mesaSource } from './mesa-source.js';
 import { Dropper, checkDrop, dropItems, walk } from './drop.js';
 import { pageUser } from './wine-user.js';
 import { PageDrag } from './drag.js';
@@ -549,27 +550,13 @@ async function begin(opts, base, at, state, meter, lets) {
   // The background fill's list (eject-site.mjs --late): lazy files the page
   // downloads once the boot's files are in, while the guest runs.
   const fillList = b.fill ? fetchJson(at(b.fill), 'the fill list').catch((e) => { say(`[app] no fill: ${e}\n`); return null; }) : null;
-  // The page compositor's Mesa, packed and kept (`mesaSource`); fetched in
-  // the background once the boot's and the fill's downloads are done.
-  // Not before the start-up is over (\`ready\`) and the boot's downloads,
-  // the fill's included, are done, and then after a pause: the program's
-  // first seconds after its first frame (the shell's taskbar, its tray)
-  // still read lazy files, which the download would share the link with.
-  // The scene compositor's Mesa too: compositor.js resolves the source on
-  // the page and hands its bytes to the compositor's worker, so Mesa comes
-  // from the site's packed files and the page's cache, never as plain files.
-  const mesa = gl ? mesaSource(fetcher, at) : null;
-  const mesaWait = { ready: false, fetched: false, started: false };
-  const prefetchMesa = (why) => {
-    mesaWait[why] = true;
-    if (!mesa || !glLazy || sq.get('glprefetch') === '0') return;
-    if (!mesaWait.ready || !mesaWait.fetched || mesaWait.started) return;
-    mesaWait.started = true;
-    setTimeout(() => {
-      const t0 = performance.now();
-      mesa.prefetch().then((n) => n && mark(`Mesa prefetched: ${n} files in ${Math.round(performance.now() - t0)} ms`));
-    }, MESA_PREFETCH_PAUSE_MS);
-  };
+  // The page compositor's Mesa, packed and kept (`mesaSource`). Fetched when
+  // the GL starts: at boot, or with `glLazy` when a program first opens its
+  // GL, never before (a visit whose programs draw no GL downloads none of
+  // it). compositor.js resolves the source on the page and hands its bytes
+  // to the compositor's worker, so Mesa comes from the site's packed files
+  // and the page's cache, each file once.
+  const mesa = gl ? mesaSource(at, (href) => packedEntry(href, fetcher), (href, z) => fetchPacked(href, z, false, fetcher)) : null;
   // The bundle's file bytes in pieces, kept in the page's cache.
   const pieceList = b.pieces ? await fetchJson(at(b.pieces), 'the pieces\' list') : null;
   // What is to come, for the progress: the bundle's files and the units'.
@@ -801,7 +788,6 @@ async function begin(opts, base, at, state, meter, lets) {
         if (++lateN === late.length) mark(`late units: ${late.length} files from the fill in ${Math.round(performance.now() - t0)} ms`, true);
       } else if (m.kind === 'done') {
         mark(`fill: ${fl.files.length} files, ${(fl.size / 1048576).toFixed(1)} MiB in ${Math.round(performance.now() - t0)} ms`, true);
-        prefetchMesa('fetched');
         // Its late units may still be compiling: it ends with the page.
       } else if (m.kind === 'failed') {
         failed(m.error);
@@ -864,8 +850,6 @@ async function begin(opts, base, at, state, meter, lets) {
     ...(fl ? [fl.url] : []),
   ], lazyVersions).catch(() => {});
   pruneFiles(fetcher).catch(() => {});
-  // No fill to wait for: the boot's downloads are done.
-  if (!fl) prefetchMesa('fetched');
 
   const term = {
     rows: 40,
@@ -997,7 +981,6 @@ async function begin(opts, base, at, state, meter, lets) {
       meter.phase('first-frame');
       if (!manual) {
         meter.phase('ready');
-        prefetchMesa('ready');
       }
     }
   }, 50);
@@ -1099,7 +1082,6 @@ async function begin(opts, base, at, state, meter, lets) {
     ready() {
       meter.phase('first-frame');
       meter.phase('ready');
-      prefetchMesa('ready');
     },
   };
 }
@@ -1312,44 +1294,6 @@ async function pruneFiles(f) {
   }
 }
 
-/** Mesa's three files (mesa-gl.js `loadFromSource`) from the site's pack and
- *  the page's cache: null for one that is not packed, which Mesa then
- *  fetches as a file. `prefetch()` puts them in the cache without decoding,
- *  and a request for one already on its way waits for that download. */
-const MESA_PREFETCH_PAUSE_MS = 20000;
-const MESA_FILES = ['gex-wgpu-replay.js', 'gex-wgpu-replay.wasm', 'gex-wgpu-replay.deferred.wasm'];
-function mesaSource(f, at) {
-  const busy = new Map();
-  const source = async (name) => {
-    await busy.get(name);
-    const href = at(`gex/${name}`);
-    const z = await packedEntry(href, f);
-    return z ? fetchPacked(href, z, false, f) : null;
-  };
-  source.prefetch = async () => {
-    let n = 0;
-    await Promise.all(MESA_FILES.map((name) => {
-      const p = (async () => {
-        const href = at(`gex/${name}`);
-        const z = await packedEntry(href, f);
-        if (!z?.h) return;
-        const u = new URL(href);
-        u.search = z.build ? `v=${z.build}` : '';
-        u.pathname += '.zst';
-        const got = await fileFetch(u.href, z.h, f, { priority: 'low' });
-        if (got.cached) return;
-        const bytes = (await got.res.arrayBuffer()).byteLength;
-        f.state.downloaded = (f.state.downloaded ?? 0) + bytes;
-        await got.put;
-        n++;
-      })().catch(() => {});
-      busy.set(name, p);
-      return p;
-    }));
-    return n;
-  };
-  return source;
-}
 
 /**
  * A file in one ArrayBuffer, not a SharedArrayBuffer: one stays resident

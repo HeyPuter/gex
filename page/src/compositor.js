@@ -10,6 +10,7 @@
 import { assetFiles, assetUrl, pageParams } from './page-env.js';
 import { startWakeRelay } from '@gex/wl-bridge.mjs';
 import { EVDEV, BTN, modsOf } from './input-map.js';
+import { mesaSources } from './mesa-source.js';
 
 export class Compositor {
   #worker;
@@ -41,12 +42,7 @@ export class Compositor {
     // pack and the page's cache, read here (a function does not cross to the
     // worker) and handed over as bytes; a file it has not is fetched there.
     const { source, ...rest } = opts;
-    let sources = null;
-    if (typeof source === 'function') {
-      const names = ['gex-wgpu-replay.js', 'gex-wgpu-replay.wasm', 'gex-wgpu-replay.deferred.wasm'];
-      const got = await Promise.all(names.map((n) => Promise.resolve().then(() => source(n)).catch(() => null)));
-      if (got.every(Boolean)) sources = Object.fromEntries(names.map((n, i) => [n, got[i]]));
-    }
+    const sources = typeof source === 'function' ? await mesaSources(source) : null;
     opts = sources ? { ...rest, sources } : rest;
     return new Promise((resolve, reject) => {
       const onMessage = ({ data: m }) => {

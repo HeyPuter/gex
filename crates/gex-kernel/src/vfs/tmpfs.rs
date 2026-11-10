@@ -608,7 +608,26 @@ pub fn set_clock(clock: crate::syscalls::ClockFn) {
     let _ = CLOCK.set(clock);
 }
 
+thread_local! {
+    /// The time of the call this thread is serving for another module
+    /// ([`at_time`]), or `i64::MIN` when none.
+    static CALL_NOW: core::cell::Cell<i64> = const { core::cell::Cell::new(i64::MIN) };
+}
+
+/// Run `f` with `now` as the time every tmpfs stamps: a module with no clock
+/// of its own serving a call that brought the caller's.
+pub fn at_time<R>(now: i64, f: impl FnOnce() -> R) -> R {
+    let was = CALL_NOW.with(|c| c.replace(now));
+    let r = f();
+    CALL_NOW.with(|c| c.set(was));
+    r
+}
+
 pub(crate) fn now() -> i64 {
+    let call = CALL_NOW.try_with(|c| c.get()).unwrap_or(i64::MIN);
+    if call != i64::MIN {
+        return call;
+    }
     (CLOCK.get().copied().unwrap_or(crate::syscalls::system_clock))().0 as i64
 }
 
@@ -791,6 +810,21 @@ impl Inner {
         }
     }
 
+    /// An entry of `path`'s directory was made or removed by a program: the
+    /// directory's modification time is now, as Linux keeps it (KService
+    /// and make compare a directory's time with their own records).
+    ///
+    /// A change with no time (0: a module with no clock, seeding) leaves
+    /// it, so a seeded directory keeps the time its entries give it.
+    fn entries_changed(&mut self, path: &str, now: i64) {
+        if now <= 0 {
+            return;
+        }
+        let d = path.rfind('/').map_or("", |i| &path[..i]);
+        self.mtimes.insert(d.to_string(), now);
+        self.inferred.remove(d);
+    }
+
     /// Move everything named under directory `from` to the same names under
     /// `to`: nodes, inodes, modes and times (a link count does not change,
     /// a name only moves).
@@ -868,6 +902,7 @@ impl TmpFs {
         inner.nodes.insert(path.to_string(), Node::Dir);
         // A program's directory is made now, as a file is.
         inner.mtimes.insert(path.to_string(), now);
+        inner.entries_changed(path, now);
         note(&inner, fs_key(&self.inner), path, Some((ino, true)), crate::inotify::mask::CREATE, 0);
         Ok(())
     }
@@ -980,6 +1015,9 @@ impl TmpFs {
         }
         inner.nodes.insert(to.to_string(), node);
         inner.inos.insert(to.to_string(), ino);
+        let t = now();
+        inner.entries_changed(from, t);
+        inner.entries_changed(to, t);
         if is_dir {
             inner.move_under(from, to);
             let lo = format!("{to}/");
@@ -1909,6 +1947,7 @@ impl TmpFs {
                     wrote = true;
                     created = true;
                     inner.nodes.insert(path.clone(), Node::File(Arc::clone(&f)));
+                    inner.entries_changed(&path, now());
                     // A program's O_CREAT mode (its umask applied): exactly
                     // that, 0 too. The kernel's own opens take the default.
                     if let Some(mode) = mode {
@@ -2074,6 +2113,7 @@ impl FileSystem for TmpFs {
                 let own = node_ino(&inner, path);
                 // Its mode too: a file made at the name later is a new one.
                 inner.forget(path);
+                inner.entries_changed(path, now());
                 if let Some(own) = own {
                     note_removed(&inner, fs_key(&self.inner), path, own);
                 }
@@ -2106,6 +2146,9 @@ impl FileSystem for TmpFs {
         inner.nodes.remove(path);
         inner.drop_ino(path);
         inner.modes.remove(path);
+        inner.mtimes.remove(path);
+        inner.inferred.remove(path);
+        inner.entries_changed(path, now());
         if let Some(own) = own {
             note_removed(&inner, fs_key(&self.inner), path, own);
         }
@@ -2155,6 +2198,7 @@ impl FileSystem for TmpFs {
         let mode = inner.modes.get(from).copied();
         inner.nodes.insert(to.to_string(), node);
         inner.set_ino(to.to_string(), ino);
+        inner.entries_changed(to, now());
         if let Some(m) = mode {
             inner.modes.insert(to.to_string(), m);
         }
@@ -2179,6 +2223,7 @@ impl FileSystem for TmpFs {
         inner.next_ino += 1;
         inner.set_ino(path.to_string(), ino);
         inner.nodes.insert(path.to_string(), Node::Socket);
+        inner.entries_changed(path, now());
         note(&inner, fs_key(&self.inner), path, Some((ino, false)), crate::inotify::mask::CREATE, 0);
         Ok(())
     }
@@ -2195,6 +2240,7 @@ impl FileSystem for TmpFs {
         inner
             .nodes
             .insert(path.to_string(), Node::Symlink(target.to_string()));
+        inner.entries_changed(path, now());
         note(&inner, fs_key(&self.inner), path, Some((ino, false)), crate::inotify::mask::CREATE, 0);
         Ok(())
     }
@@ -2228,6 +2274,39 @@ fn reserve(data: &mut Vec<u8>, len: usize) -> Result<(), Errno> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A program making or removing a name moves its directory's time, as on
+    /// Linux; seeding does not. A KService database built with the image
+    /// compares the time of /usr/share/applications with its own, so a
+    /// package's desktop entry was never found while the directory kept its
+    /// seeded time.
+    #[test]
+    fn a_name_made_or_removed_moves_its_directory_time() {
+        use crate::fs::oflags::{O_CREAT, O_RDWR};
+        let fs = TmpFs::new();
+        fs.add_dir("apps");
+        fs.add_file("apps/seeded.desktop", b"x".to_vec());
+        let dir = |fs: &TmpFs| FileSystem::metadata(fs, "apps").unwrap().mtime;
+        FileSystem::set_mtime(&fs, "apps", 1_000).unwrap();
+        fs.add_file("apps/also-seeded.desktop", b"x".to_vec());
+        assert_eq!(dir(&fs), 1_000, "seeding keeps the directory's time");
+        let steps: [(&str, &dyn Fn(&TmpFs)); 6] = [
+            ("create", &|fs| { fs.open("apps/new.desktop", O_RDWR | O_CREAT, 0o644).unwrap(); }),
+            ("rename in", &|fs| { fs.open("t", O_RDWR | O_CREAT, 0o644).unwrap(); fs.rename("t", "apps/moved.desktop").unwrap(); }),
+            ("unlink", &|fs| fs.unlink("apps/new.desktop").unwrap()),
+            ("mkdir", &|fs| fs.mkdir("apps/sub", 0o755).unwrap()),
+            ("rmdir", &|fs| fs.rmdir("apps/sub").unwrap()),
+            ("symlink", &|fs| fs.symlink("seeded.desktop", "apps/link.desktop").unwrap()),
+        ];
+        for (what, step) in steps {
+            FileSystem::set_mtime(&fs, "apps", 1_000).unwrap();
+            step(&fs);
+            assert!(dir(&fs) > 1_000, "{what} in the directory moves its time");
+        }
+        FileSystem::set_mtime(&fs, "apps", 1_000).unwrap();
+        fs.rename("apps/moved.desktop", "gone.desktop").unwrap();
+        assert!(dir(&fs) > 1_000, "a rename out of the directory moves its time");
+    }
 
     /// A lazy file's time does not come from the clock: two loads of the same
     /// site, a second apart, see the same time for it, and a recorded time

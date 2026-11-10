@@ -1,7 +1,7 @@
 // An X client's EGL window on the page, for the window tests: the probe
 // (/probes/NAME in the gl-probes image, x86) is spawned beside HostWindows,
 // its window found by its title, its frames waited for and the page's pixel
-// in the window checked to be the probe's magenta. `more(out)` may look at
+// in the window checked to be the probe's magenta, its window 200x150 by then. `more(out)` may look at
 // the probe's other lines once its frames are in.
 import { System } from '../../page/runtime/src/index.js';
 import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
@@ -37,10 +37,12 @@ export async function glWindow(t, probe, more = () => {}) {
   const said = () => `stdout ${JSON.stringify(out)}, stderr ${JSON.stringify(err.slice(-8))}, console ${JSON.stringify(sys.state.console.slice(-600))}`;
   const w = await until(() => wins.find((x) => x.title === probe), 'its X window', 60000)
     .catch((e) => { throw new Error(`${e.message}; ${said()}`); });
-  eq('size', [w.width, w.height], [200, 150]);
   await until(() => out.some((l) => l.startsWith('frames')), 'its frames', 120000)
     .catch((e) => { throw new Error(`${e.message}; ${said()}`); });
   eq('no GL error', out.find((l) => l.startsWith('frames')), 'frames 30 gl error 0');
+  // (a probe may resize its window before its last frame)
+  await until(() => w.width === 200 && w.height === 150, 'its window at 200x150', 10000).catch(() => {});
+  eq('size', [w.width, w.height], [200, 150]);
   more(out);
   const r = w.canvas.getBoundingClientRect();
   const at = [Math.round(r.left + 100), Math.round(r.top + 75)];

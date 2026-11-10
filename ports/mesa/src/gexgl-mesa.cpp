@@ -297,6 +297,13 @@ struct gex_surface {
     unsigned generation = 0;
     /* Its frames come from the D3D device (gex_gl_external_frame). */
     bool external = false;
+    /* The colour buffer of the frame last presented, held until the next
+     * present: what the page shows. A resize drops the drawable's buffers
+     * right after the present it follows (eglSwapBuffers notices the new
+     * size then), before the page has shown that frame; without this a
+     * client that draws only on a change (gpui after a window manager's
+     * resize) never had a frame shown at all. */
+    struct pipe_resource* shown = nullptr;
 };
 
 /* This client's surfaces, and which is current. `sur` is always the entry
@@ -461,6 +468,7 @@ void drop_surface(uint32_t handle, bool repoint = true) {
     if (found == surfaces.end()) return;
     for (struct pipe_resource*& attachment : found->second.drawable.attachments)
         pipe_resource_reference(&attachment, nullptr);
+    pipe_resource_reference(&found->second.shown, nullptr);
     /* And out of st/mesa's table of live drawables, so the next make-current
      * lets go of the framebuffer built on it. Left there, the entry outlived
      * the memory, and a later drawable at the same address with the same ID
@@ -1521,7 +1529,11 @@ WGPUSurface present_target(WGPUDevice device) {
 void present_backend() {
     glFinish();
     ++produced;
-    if (sur) ++sur->produced;
+    if (sur) {
+        ++sur->produced;
+        pipe_resource_reference(&sur->shown,
+                                sur->drawable.attachments[ST_ATTACHMENT_BACK_LEFT]);
+    }
 }
 
 /* True when this surface has something to show: a new frame, or its last one
@@ -1557,8 +1569,10 @@ bool display_backend() {
         auto found = window_canvases.find(sur->uid);
         if (found != window_canvases.end()) found->second.reshow = false;
     }
-    struct pipe_resource *source =
-        sur->drawable.attachments[ST_ATTACHMENT_BACK_LEFT];
+    /* The presented frame's buffer, which a resize since has not taken; a
+     * D3D window's frames are its back buffer itself. */
+    struct pipe_resource *source = sur->shown && !sur->external
+        ? sur->shown : sur->drawable.attachments[ST_ATTACHMENT_BACK_LEFT];
     WGPUTexture from = source ? gex_wgpu_resource_texture(source) : nullptr;
     WGPUDevice device = display_device();
     WGPUSurface target = device ? present_target(device) : nullptr;
@@ -1640,13 +1654,16 @@ bool display_backend() {
         src.texture = from;
         WGPUTexelCopyTextureInfo dst = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
         dst.texture = surface_texture.texture;
-        /* The smaller of the two: a window canvas is sized to its drawable,
-         * the shared one may still be at its old size for a frame. */
+        /* The smallest of the three: a window canvas is sized to its
+         * drawable, the shared one may still be at its old size for a frame,
+         * and the frame shown may be from before a resize. */
         WGPUExtent3D size{
-            std::min(sur->drawable.width,
-                     wgpuTextureGetWidth(surface_texture.texture)),
-            std::min(sur->drawable.height,
-                     wgpuTextureGetHeight(surface_texture.texture)),
+            std::min({sur->drawable.width,
+                      wgpuTextureGetWidth(surface_texture.texture),
+                      wgpuTextureGetWidth(from)}),
+            std::min({sur->drawable.height,
+                      wgpuTextureGetHeight(surface_texture.texture),
+                      wgpuTextureGetHeight(from)}),
             1};
         wgpuCommandEncoderCopyTextureToTexture(encoder, &src, &dst, &size);
         WGPUCommandBuffer commands = wgpuCommandEncoderFinish(encoder, nullptr);
@@ -1691,7 +1708,11 @@ bool display_pending(const gex_surface& s) { return s.displayed < s.produced; }
 void present_backend() {
     glFinish();
     ++produced;
-    if (sur) ++sur->produced;
+    if (sur) {
+        ++sur->produced;
+        pipe_resource_reference(&sur->shown,
+                                sur->drawable.attachments[ST_ATTACHMENT_BACK_LEFT]);
+    }
 }
 
 bool display_backend() {
@@ -2089,9 +2110,11 @@ bool one(uint32_t op, Reader& a) {
             mesa_context = nullptr;
         }
         reset_guest_namespace();
-        for (auto& entry : surfaces)
+        for (auto& entry : surfaces) {
             for (struct pipe_resource*& attachment : entry.second.drawable.attachments)
                 pipe_resource_reference(&attachment, nullptr);
+            pipe_resource_reference(&entry.second.shown, nullptr);
+        }
         break;
     }
     case SURFACE_DETACH: {
