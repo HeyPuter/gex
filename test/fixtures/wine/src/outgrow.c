@@ -8,6 +8,8 @@
  *   outgrow fallback   no room: reserves 64 MiB instead and exits 0
  *   outgrow twice M    runs `outgrow M` twice, one after the other
  *                      (CreateProcess each), and says how each ended
+ *   outgrow each M X.. the same for each program X (a copy of this one),
+ *                      each start the moment the one before ends
  *
  * Each run says "outgrow big high" when it got the 3.5 GiB above 4 GiB.
  * gex-nt-arch: x64
@@ -18,14 +20,15 @@
 
 #define BIG ((SIZE_T)7 << 29)
 
-static void once(const char *mode) {
+static void once(const char *exe, const char *mode) {
     char me[MAX_PATH], cmd[MAX_PATH + 32];
     STARTUPINFOA si = { sizeof si };
     PROCESS_INFORMATION pi;
     DWORD code = 0;
 
     fflush(stdout);
-    GetModuleFileNameA(NULL, me, sizeof me);
+    if (exe) snprintf(me, sizeof me, "%s", exe);
+    else GetModuleFileNameA(NULL, me, sizeof me);
     snprintf(cmd, sizeof cmd, "\"%s\" %s", me, mode);
     if (!CreateProcessA(me, cmd, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
         printf("outgrow child not started: %lu\n", GetLastError());
@@ -43,8 +46,16 @@ int main(int argc, char **argv) {
     void *p;
 
     if (argc > 2 && !strcmp(argv[1], "twice")) {
-        once(argv[2]);
-        once(argv[2]);
+        once(NULL, argv[2]);
+        once(NULL, argv[2]);
+        return 0;
+    }
+    if (argc > 3 && !strcmp(argv[1], "each")) {
+        int i;
+        for (i = 3; i < argc; i++) {
+            once(argv[i], argv[2]);
+            once(argv[i], argv[2]);
+        }
         return 0;
     }
     p = VirtualAlloc(NULL, BIG, MEM_RESERVE, PAGE_NOACCESS);

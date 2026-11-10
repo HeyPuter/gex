@@ -11812,6 +11812,8 @@ fn end_process_once(home: &sigs::Home, code: i32) {
     set_exited(true);
     waitq::wake_process();
     let pid = home.pid();
+    // Its memory record before anything can see it gone (`outgrow_end`).
+    outgrow_end(pid, code);
     // Descriptors go first and explicitly: a trap out of wasm does not unwind,
     // so nothing is dropped, and a pipe end between two Workers lives in the
     // global kernel and only learns of a close from `Drop` -- otherwise the
@@ -20423,6 +20425,7 @@ pub extern "C" fn gex_abandon(code: i32) {
     // no longer exists and the parent's `read` never returns: the run wedges
     // one process further along than the one that died, which is the shape
     // that made a lifter fault in a forked child look like a hang in `apt`.
+    outgrow_end(pid, code);
     hold_wakes();
     if let Some(fds) = fds_free() {
         fds.close_all();
@@ -20451,11 +20454,21 @@ fn publish_exit(pid: i32, status: i32) {
     // SAFETY: no arguments; the host only waits for its own deliveries.
     unsafe { drain_output() };
     if let Some(home) = sigs::home() {
-        // Whether it outgrew its memory, for its next start.
-        // (`status` is an exit code, or a signal's number negated)
+        outgrow_end(pid, status);
+        home.procs().exit(pid, status);
+    }
+}
+
+/// Whether process `pid`, ending with `status` (an exit code, or a signal's
+/// number negated), outgrew its memory: recorded for its next start before
+/// its descriptors close, as anything that sees it gone may start it again
+/// (a Windows parent hears of a child's end from wineserver, at the close
+/// of its connection, before any `wait4`). Once per process: a second call
+/// finds nothing.
+fn outgrow_end(pid: i32, status: i32) {
+    if let Some(home) = sigs::home() {
         let word = if status < 0 { (-status) & 0x7f } else { (status & 0xff) << 8 };
         gex_kernel::syscalls::outgrow_ending(pid, word, home.procs());
-        home.procs().exit(pid, status);
     }
 }
 
@@ -20542,6 +20555,7 @@ pub extern "C" fn gex_process_gone(status: i32) -> u32 {
     set_exited(true);
     waitq::wake_process();
     let pid = my_pid();
+    outgrow_end(pid, status);
     let n = unsafe {
         if k_present() != 0 {
             let n = k_pipe_forget(pid);

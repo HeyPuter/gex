@@ -9,7 +9,9 @@
 // run's prefix (the record is what is checked: natively a Windows program
 // runs in the lowered memory only), and on the page, where the program
 // starts itself twice and the second goes on in the memory64 twin
-// (WINE64_TWIN=1).
+// (WINE64_TWIN=1). Each second start comes the moment the first ends,
+// so the record must be made before anything can see the first gone:
+// on the page, a run of copies started that way, each found recorded.
 import { copyFileSync, existsSync, mkdirSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
@@ -58,6 +60,14 @@ export default async function (t) {
   // (run-node shows no crash notices: the line gex says as the record is
   // made; the notice's reason is the kernel's, as natively)
   t.check('page: gex says it needs 64-bit memory', SAID.test(p.out), w.detail(p));
+  // the same race, more times: each copy's second start, at once, finds
+  // its record
+  const N = 6, copies = {}, names = [];
+  for (let i = 0; i < N; i++) { copies[`/t/og${i}.exe`] = exe; names.push(`Z:\\t\\og${i}.exe`); }
+  copies['/t/outgrow.exe'] = exe;
+  const pl = await w.page(['/t/outgrow.exe', 'each', 'crash', ...names], { files: copies, name: 'page-relaunch', timeout: 1200000 });
+  t.eq(`page: ${N} programs each relaunched the moment they crash have a 64-bit memory at once`, lines(pl.out),
+    Array(N).fill('outgrow short\noutgrow child exit c0000005\noutgrow big high\noutgrow child exit 00000000').join('\n'), w.detail(pl));
   const pf = await w.page(['/t/outgrow.exe', 'twice', 'fallback'], { files: { '/t/outgrow.exe': exe }, name: 'page-fallback', timeout: 600000 });
   t.eq('page: one that falls back and exits 0 is not recorded and keeps the lowered memory', lines(pf.out),
     'outgrow fallback ok\noutgrow child exit 00000000\noutgrow fallback ok\noutgrow child exit 00000000', w.detail(pf));
