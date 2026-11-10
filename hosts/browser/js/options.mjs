@@ -55,6 +55,9 @@ export const OPTIONS = [
   ['pinRegion',      'GEX_PIN_REGION',       'pinregion',     'GEX_PIN_REGION',        'num',    'extra', true],
   // A crash report names the SEH chain and a longjmp's jmp_buf.
   ['sehReport',      'GEX_SEH_REPORT',       'sehreport',     'GEX_SEH_REPORT',        'one',    'extra', true],
+  // The processors every process is told it has (`gex_kernel::cpus`), in
+  // place of navigator.hardwareConcurrency: for a page that wants fewer.
+  ['cpus',           'GEX_CPUS',             'cpus',          'GEX_CPUS',              'num',    'extra', false],
   // Benchmarks only: the monotonic clocks N times real speed, the wall clock
   // starting at Unix time S.
   ['timeScale',      'GEX_TIME_SCALE',       'timescale',     null,                    'num',    'extra', true],

@@ -45,6 +45,8 @@ const RELAY_MIN_BYTES = 256 * 1024;
 // Run switches a Worker takes at the top of its message as well as in its
 // run options (worker.mjs's `run`), which an exec it adopts takes too.
 const EXEC_SWITCHES = ['link', 'dense', 'fjit', 'fjitMax', 'fjitOnly', 'liftMax', 'inlineDispatch', 'xlateReport', 'discoverSkip', 't1Fold', 'providers', 'xcache'];
+/** The processors a process is told: `n`, the page's (`Gex.cpus`), or the host's. */
+const cpuCount = (n) => n || Gex.cpus || globalThis.navigator?.hardwareConcurrency || 1;
 /** A value for an address-typed global: i64 (BigInt) in a wasm64 module. */
 const addrVal = (w, v) => (w ? BigInt(v >>> 0) : v | 0);
 /** An address a wasm program passed to a `gex` import: a BigInt from a
@@ -1893,6 +1895,9 @@ export class Gex {
   /// A dispatch page whose directory writes should be narrated, or -1: every
   /// writer of `DISPATCH_DIR` reports itself, naming the one that moves it.
   static watchDir = -1;
+  /** The processors a page tells every process (its host's `extra.cpus`),
+   *  0 for the host's own count. */
+  static cpus = 0;
   /** `soname=path,...` (the page's `?wasmdlls=`): libraries replaced by wasm64 providers. */
   static wasmDlls = '';
   /** `name,...` (the page's `?elfunits=`): shared objects that get function-tier units. */
@@ -2590,8 +2595,9 @@ export class Gex {
     // set before it (not merely in `useNetwork`, before the shim exists).
     this.#shim.exports.gex_set_network?.(this.#net ? 1 : 0);
     // The processors the guest sees: each of its threads is a Worker, so the
-    // host's count (`opts.cpus` overrides it).
-    this.#shim.exports.gex_set_cpus?.(opts.cpus || globalThis.navigator?.hardwareConcurrency || 1);
+    // host's count (`opts.cpus`, or the page's `extra.cpus` for every process,
+    // overrides it).
+    this.#shim.exports.gex_set_cpus?.(cpuCount(opts.cpus));
     // Narrate one page's directory writes, in every process.
     if (Gex.watchDir >= 0) this.#shim.exports.gex_watch_dir?.(BigInt(Gex.watchDir));
     // wasm-ld puts the shim's stack at address zero (the guest's image); move
@@ -3231,7 +3237,7 @@ export class Gex {
       this.#shim.exports.gex_set_network?.(this.#net ? 1 : 0);
       // The processors, as `load` gives them: a forked or spawned child is
       // a process of its own, which would otherwise see one
-      this.#shim.exports.gex_set_cpus?.(globalThis.navigator?.hardwareConcurrency || 1);
+      this.#shim.exports.gex_set_cpus?.(cpuCount());
       // The unit cache and ELF export providers, as `load` gives a process its
       // own: a forked child's table starts empty while its GOT holds what
       // its parent's providers made code (cgen/elfprov.rs).

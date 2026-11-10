@@ -363,6 +363,8 @@ async function endUnstarted(msg) {
 async function handle(msg) {
   // GEX_LOG from the page (`extra.log`): a Worker sees neither its globals nor its query.
   setLog(msg?.log);
+  // The processors every process is told (`extra.cpus`), when the page says
+  if (msg?.cpus) Gex.cpus = msg.cpus;
   if (msg?.unitFiles?.buf) {
     const { buf, index } = msg.unitFiles;
     for (const [rel, off, len] of index) if (!unitFiles.has(rel)) unitFiles.set(rel, len < 0 ? null : new Uint8Array(buf, off, len));

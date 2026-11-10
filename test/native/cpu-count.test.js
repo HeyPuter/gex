@@ -28,4 +28,8 @@ export default async function (t) {
   t.eq(`page (${want} processors)`, line(p.stdout), all(want), tail(p.stderr));
   // a forked child: a process of its own, told the count when it attaches
   t.eq(`page, a forked child (${want} processors)`, line(p.stdout, 'child '), all(want), tail(p.stderr));
+  // a page that tells every process fewer (GEX_CPUS here, ?cpus= on a page)
+  const q = await n.g.run(n.g.seed(), prog, [], { env: { GEX_SHARED: '1', GEX_CPUS: '3' } });
+  t.eq('page, cpus=3', line(q.stdout), all(3), tail(q.stderr));
+  t.eq('page, cpus=3, a forked child', line(q.stdout, 'child '), all(3), tail(q.stderr));
 }
