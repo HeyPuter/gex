@@ -1,9 +1,9 @@
 #!/bin/sh
-# A container linked with GEXCC_BAKE_RUNNER empty (a package built for an
-# image) names no runner and no path of the gexcc install: it still runs on
-# the build machine through GEXCC_RUNNER, and under gexc directly. One linked
-# with GEXCC_BAKE_RUNNER=PATH names PATH; one linked without the variable
-# names the install's runner, as before. A C++ program (libc++abi's
+# A container linked without GEXCC_BAKE_RUNNER, or with it empty, names no
+# runner and no path of the gexcc install (what is built may go into an
+# image): on the build machine it still runs, through GEXCC_RUNNER or the
+# install's gexcc-exec on PATH, and says so (127) when there is neither. One
+# linked with GEXCC_BAKE_RUNNER=PATH names PATH. A C++ program (libc++abi's
 # assert()s, the runtime, the sysroot's headers) names no install path
 # either way.
 #
@@ -50,7 +50,7 @@ GEXCC_BAKE_RUNNER= gexc++ -w -o "$W/cxx" "$W/q.cpp" || { echo "FAIL build cxx"; 
 [ "$(local_paths "$W/none")" = 0 ] && ok "empty: names no install path" || bad "empty: names $P or $RUNNER"
 [ "$(names "$W/other" /opt/elsewhere/gexcc-exec)" != 0 ] && [ "$(local_paths "$W/other")" = 0 ] &&
     ok "a path: names it" || bad "a path: not baked as given"
-[ "$(names "$W/default" "$RUNNER")" != 0 ] && ok "unset: the install's runner" || bad "unset: no runner baked"
+[ "$(local_paths "$W/default")" = 0 ] && ok "unset: names no install path" || bad "unset: names $P or $RUNNER"
 [ "$(local_paths "$W/cxx")" = 0 ] && ok "c++: names no install path" || bad "c++: names $P or $RUNNER"
 # libc++abi's own names come from how build-cxx.sh built it: an install whose
 # libc++abi.a predates the map is said, not failed (it is the install's)
@@ -61,8 +61,8 @@ else bad "c++: names libc++abi's build tree"; cxxabi_paths "$W/cxx" | head -3; f
 want="ran a 2"
 got=$(GEXCC_RUNNER=$RUNNER "$W/none" a 2>&1); s=$?
 [ "$got" = "$want" ] && [ $s = 3 ] && ok "empty: runs through GEXCC_RUNNER" || bad "empty: GEXCC_RUNNER run gave '$got' (exit $s)"
-got=$(env -u GEXCC_RUNNER "$W/default" a 2>&1); s=$?
-[ "$got" = "$want" ] && [ $s = 3 ] && ok "unset: runs through the baked runner" || bad "unset: gave '$got' (exit $s)"
+got=$(env -u GEXCC_RUNNER PATH="$B:/usr/bin:/bin" "$W/default" a 2>&1); s=$?
+[ "$got" = "$want" ] && [ $s = 3 ] && ok "unset: runs through gexcc-exec on PATH" || bad "unset: gave '$got' (exit $s)"
 got=$(env -u GEXCC_RUNNER PATH=/nonexistent "$W/none" a 2>&1); s=$?
 [ $s = 127 ] && ok "empty, no runner anywhere: says so (127)" || bad "empty, no runner: exit $s ($got)"
 got=$(GEXCC_RUNNER=$RUNNER "$W/cxx" 2>&1); s=$?

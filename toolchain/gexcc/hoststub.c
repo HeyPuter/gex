@@ -7,7 +7,9 @@
  * build machine like a native one.
  *
  *   runner: $GEXCC_RUNNER, else the path baked into the container at link
- *           time (the trailer below), else `gexc` on $PATH
+ *           time (the trailer below: GEXCC_BAKE_RUNNER), else `gexcc-exec`
+ *           on $PATH (gexcc's install: its slots bound how many run at
+ *           once), else `gexc` on $PATH
  *   argv:   RUNNER run --host-env --argv0 ARGV0 /proc/self/exe's target ARGS...
  *
  * Freestanding, position-independent i386 code; nothing but syscalls.
@@ -87,26 +89,35 @@ __attribute__((used)) void gexcc_host_main(long *sp)
 		say("gexcc: cannot run the gexc named by GEXCC_RUNNER or the container\n");
 		sys3(SYS_exit, 127, 0, 0);
 	}
-	/* `gexc` on $PATH */
+	/* `gexcc-exec`, then `gexc`, on $PATH */
 	char buf[4096];
-	const char *p = path;
-	for (;;) {
-		const char *q = p;
-		while (*q && *q != ':')
-			q++;
-		unsigned l = q - p;
-		if (l && l < sizeof buf - 6) {
-			for (unsigned i = 0; i < l; i++)
-				buf[i] = p[i];
-			buf[l] = '/';
-			buf[l + 1] = 'g', buf[l + 2] = 'e', buf[l + 3] = 'x', buf[l + 4] = 'c', buf[l + 5] = 0;
-			sys3(SYS_execve, (long)buf, (long)nargv, (long)envp);
+	for (int w = 0; w < 2; w++) {
+		/* (no table of pointers: nothing relocates this code's data) */
+		const char *nm = w ? "gexc" : "gexcc-exec";
+		unsigned nl = 0;
+		while (nm[nl])
+			nl++;
+		const char *p = path;
+		for (;;) {
+			const char *q = p;
+			while (*q && *q != ':')
+				q++;
+			unsigned l = q - p;
+			if (l && l + nl + 2 < sizeof buf) {
+				for (unsigned i = 0; i < l; i++)
+					buf[i] = p[i];
+				buf[l] = '/';
+				for (unsigned i = 0; i <= nl; i++)
+					buf[l + 1 + i] = nm[i];
+				nargv[0] = buf;
+				sys3(SYS_execve, (long)buf, (long)nargv, (long)envp);
+			}
+			if (!*q)
+				break;
+			p = q + 1;
 		}
-		if (!*q)
-			break;
-		p = q + 1;
 	}
-	say("gexcc: this is a gex wasm32 program and no gexc was found (set GEXCC_RUNNER or put gexc on PATH)\n");
+	say("gexcc: this is a gex wasm32 program and no gexc was found (set GEXCC_RUNNER or put gexcc-exec or gexc on PATH)\n");
 	sys3(SYS_exit, 127, 0, 0);
 }
 
