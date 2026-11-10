@@ -42,7 +42,9 @@
 //            x86's also has gles-window (/probes/gles-window), an X client
 //            with the host's Xlib beside it, and gles-window-xcb
 //            (/probes/gles-window-xcb), the same with libxcb alone through
-//            EGL_EXT_platform_xcb, when the host has Xlib.
+//            EGL_EXT_platform_xcb, and gles-window-fbo-xcb
+//            (/probes/gles-window-fbo-xcb), that presenting as wgpu does,
+//            when the host has Xlib.
 //            Needs gcc, the host's EGL and GL headers and libraries, and
 //            third_party/opengl-registry.
 
@@ -280,6 +282,8 @@ export const images = {
     h.update(readFileSync(window));
     const windowXcb = join(probes, 'gles-window-xcb.c');
     h.update(readFileSync(windowXcb));
+    const windowFboXcb = join(probes, 'gles-window-fbo-xcb.c');
+    h.update(readFileSync(windowFboXcb));
     h.update(readFileSync(new URL(import.meta.url))); // how it is built
     h.update(String(existsSync(musl)));
     const key = h.digest('hex');
@@ -349,6 +353,7 @@ export const images = {
         mkdirSync(join(tree, 'tmp'), { recursive: true });
         run(x.cc, ['-O2', `-I${reg}`, `-I${inc}`, '-o', join(tree, 'probes/gles-window'), window, `-L${gl}`, '-l:libEGL.so.1', '-l:libGLESv2.so.2', '-ldl']);
         run(x.cc, ['-O2', `-I${reg}`, `-I${inc}`, '-o', join(tree, 'probes/gles-window-xcb'), windowXcb, `-L${gl}`, '-l:libEGL.so.1', '-l:libGLESv2.so.2', '-ldl']);
+        run(x.cc, ['-O2', `-I${reg}`, `-I${inc}`, '-o', join(tree, 'probes/gles-window-fbo-xcb'), windowFboXcb, `-L${gl}`, '-l:libEGL.so.1', '-l:libGLESv2.so.2', '-ldl']);
       }
       execFileSync('tar', ['-cf', join(work, `gl-probes-${a}.tar`), '-C', tree, '.']);
     }
