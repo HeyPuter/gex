@@ -22,11 +22,26 @@ export default async function (t) {
   await timeout(sys.boot(), 60000, 'boot');
   const env = { PATH: '/bin:/usr/bin', HOME: '/root' };
   const run = (argv) => timeout(sys.run(argv, { env }), 60000, argv.join(' '));
+  // The count once it holds still (300 ms): a process's run ends before its
+  // Worker lets its memory go, and the pool's next one is made ahead after
+  // an exec, both a moment later on a busy host.
+  const settled = async () => {
+    let last = tabMemories().live;
+    for (let i = 0, still = 0; i < 200 && still < 6; i++) {
+      await new Promise((r) => setTimeout(r, 50));
+      const n = tabMemories().live;
+      still = n === last ? still + 1 : 0;
+      last = n;
+    }
+    return last;
+  };
 
   await run(['true']);
+  await settled();
   const before = tabMemories(null, { reset: true });
   check('counted', before && before.live > 0, JSON.stringify(before));
   const r = await run(['sh', '-c', 'sh -c true; sh -c true; echo ran']);
+  await settled();
   const after = tabMemories();
   t.say(`tab memories: ${before.live} live before, ${after.peak} at most, ${after.live} after`);
   check('a process memory is counted while it runs', r.stdout === 'ran\n' && after.peak > before.live, `${JSON.stringify(r)} ${JSON.stringify(after)}`);
