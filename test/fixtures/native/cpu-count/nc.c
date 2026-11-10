@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include <sched.h>
+#include <sys/wait.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -11,7 +12,7 @@ static int lines(const char *path, const char *prefix, int skip_aggregate) {
     fclose(f);
     return n;
 }
-int main(void) {
+int main(int argc, char **argv) {
     cpu_set_t s; CPU_ZERO(&s);
     int aff = sched_getaffinity(0, sizeof s, &s) == 0 ? CPU_COUNT(&s) : -1;
     /* /sys/devices/system/cpu: the online list, and one topology entry per processor. */
@@ -23,7 +24,15 @@ int main(void) {
         if (!(f = fopen(p, "r"))) break;
         fclose(f); topo++;
     }
-    printf("affinity=%d sysconf=%ld stat=%d cpuinfo=%d sys=%d topology=%d\n", aff, sysconf(_SC_NPROCESSORS_ONLN),
+    printf("%saffinity=%d sysconf=%ld stat=%d cpuinfo=%d sys=%d topology=%d\n", argc > 1 ? "child " : "", aff, sysconf(_SC_NPROCESSORS_ONLN),
            lines("/proc/stat", "cpu", 1), lines("/proc/cpuinfo", "processor", 0), sys, topo);
+    /* A child, in a process of its own (a fresh Worker on the page), sees the same. */
+    if (argc == 1) {
+        int st;
+        fflush(stdout);
+        pid_t pid = fork();
+        if (pid == 0) { char *args[] = { argv[0], "child", 0 }; int r = main(2, args); fflush(stdout); _exit(r); }
+        if (pid < 0 || waitpid(pid, &st, 0) != pid) return 1;
+    }
     return 0;
 }

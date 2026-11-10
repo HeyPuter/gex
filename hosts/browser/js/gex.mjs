@@ -3229,6 +3229,9 @@ export class Gex {
       if (this.#wlOut) this.#shim.exports.gex_set_wl_output?.(...this.#wlOut);
       if (this.#wlOut) this.#shim.exports.gex_set_wl_scale?.(this.#wlScale);
       this.#shim.exports.gex_set_network?.(this.#net ? 1 : 0);
+      // The processors, as `load` gives them: a forked or spawned child is
+      // a process of its own, which would otherwise see one
+      this.#shim.exports.gex_set_cpus?.(globalThis.navigator?.hardwareConcurrency || 1);
       // The unit cache and ELF export providers, as `load` gives a process its
       // own: a forked child's table starts empty while its GOT holds what
       // its parent's providers made code (cgen/elfprov.rs).
