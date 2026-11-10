@@ -1518,9 +1518,11 @@ pub use crate::locks::{lock_op, FileLocks};
 #[derive(Debug, Default)]
 pub struct EpollSet {
     watched: Mutex<Vec<Watch>>,
-    /// Each watched descriptor's open file (and whether it was opened for
-    /// writing), as `epoll_ctl` or a waiter last found it: what the set asks
-    /// when it is itself polled ([`FileHandle::poll_readable`]).
+    /// The open file each watch is of (and whether it was opened for
+    /// writing): the one `epoll_ctl` added, or for a set that came without
+    /// them (a fork's copy), the one a waiter first found under the number.
+    /// A watch is of that file and not of its number, as on Linux: it goes
+    /// once the file is closed, and a new file given the number is not it.
     files: Mutex<Vec<(i32, Weak<dyn FileHandle>, bool)>>,
     queue: crate::wait::Queue,
     generation: AtomicU32,
@@ -1616,6 +1618,57 @@ impl EpollSet {
         r
     }
 
+    /// `epoll_ctl` on `fd`, which is `file` now (`None`: not open). A
+    /// watch under the number that is of another file, or of one since
+    /// closed, is gone first: adding the number again is a new watch, and
+    /// changing or deleting it finds none.
+    pub fn ctl_file(&self, op: u64, fd: i32, events: u32, data: u64, file: Option<(&Arc<dyn FileHandle>, bool)>) -> SysResult {
+        if let Some((now, _)) = file {
+            if let Some(Some(was)) = self.owner_weak(fd) {
+                let same = was.upgrade().is_some_and(|h| core::ptr::eq(Arc::as_ptr(&h) as *const (), Arc::as_ptr(now) as *const ()));
+                if !same {
+                    self.forget(fd);
+                }
+            }
+        }
+        let source = file.map_or(0, |(f, _)| f.wait_queue());
+        let r = self.ctl_queue(op, fd, events, data, source)?;
+        if let (epoll_op::ADD, Some((f, writable))) = (op, file) {
+            let mut files = self.files.lock().unwrap_or_else(|e| e.into_inner());
+            files.retain(|x| x.0 != fd);
+            files.push((fd, Arc::downgrade(f), writable));
+        }
+        Ok(r)
+    }
+
+    /// The file `fd`'s watch is of: `None` when the set has not been told
+    /// one, `Some(None)` when it was closed.
+    fn owner_weak(&self, fd: i32) -> Option<Option<Weak<dyn FileHandle>>> {
+        let files = self.files.lock().unwrap_or_else(|e| e.into_inner());
+        files.iter().find(|x| x.0 == fd).map(|x| Some(x.1.clone()))
+    }
+
+    /// The open file `fd`'s watch is of and whether it is writable: `None`
+    /// when the set has not been told one, `Some(None)` once it is closed.
+    pub fn owner(&self, fd: i32) -> Option<Option<(Arc<dyn FileHandle>, bool)>> {
+        let files = self.files.lock().unwrap_or_else(|e| e.into_inner());
+        files.iter().find(|x| x.0 == fd).map(|x| x.1.upgrade().map(|h| (h, x.2)))
+    }
+
+    /// Drop `fd`'s watch: its file is closed, or the number is another's.
+    pub fn forget(&self, fd: i32) {
+        let mut w = self.watched.lock().unwrap_or_else(|e| e.into_inner());
+        let me = self.queue.id();
+        for x in w.iter().filter(|x| x.fd == fd) {
+            crate::wait::unchain(x.source, me);
+        }
+        w.retain(|x| x.fd != fd);
+        drop(w);
+        self.files.lock().unwrap_or_else(|e| e.into_inner()).retain(|x| x.0 != fd);
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        self.queue.notify();
+    }
+
     /// Make sure this set is chained onto `source`, the queue descriptor
     /// `fd` has now (a descriptor closed and its number reused names a new
     /// object). Called as a waiter collects the set's descriptors.
@@ -1630,13 +1683,17 @@ impl EpollSet {
         }
     }
 
-    /// `fd`'s open file now, for [`FileHandle::poll_readable`]; chains the
-    /// set onto its queue as [`EpollSet::rechain`] does.
+    /// `fd`'s open file, for a watch the set was not told the file of (a
+    /// fork's copy); chains the set onto its queue as [`EpollSet::rechain`]
+    /// does. A watch that has a file keeps it.
     pub fn note_file(&self, fd: i32, file: &Arc<dyn FileHandle>, writable: bool) {
-        self.rechain(fd, file.wait_queue());
         let mut f = self.files.lock().unwrap_or_else(|e| e.into_inner());
-        f.retain(|x| x.0 != fd);
+        if f.iter().any(|x| x.0 == fd) {
+            return;
+        }
         f.push((fd, Arc::downgrade(file), writable));
+        drop(f);
+        self.rechain(fd, file.wait_queue());
     }
 
     /// A set already holding `watches`: a fork's child's copy of its
