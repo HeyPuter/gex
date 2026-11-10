@@ -738,6 +738,84 @@ def imports(path):
     return res
 
 
+
+def widest_table_params(path):
+    """The most parameters of any function a table holds (the element
+    segments, active or passive): what binaryen's --fpcast-emu needs as
+    max-func-params, since each such function gets a thunk that width."""
+    w = open(path, 'rb').read()
+
+    def leb(p):
+        r = sh = 0
+        while True:
+            x = w[p]; p += 1
+            r |= (x & 0x7f) << sh; sh += 7
+            if not x & 0x80:
+                return r, p
+
+    def expr(p):
+        # a constant expression: the function a ref.func names, if any
+        f = None
+        while w[p] != 0x0b:
+            op = w[p]; p += 1
+            if op == 0xd2:
+                f, p = leb(p)
+            elif op in (0x41, 0x42, 0x23):
+                _, p = leb(p)
+            elif op == 0xd0:
+                p += 1
+        return f, p + 1
+    params, ftypes, elems, p = [], [], [], 8
+    while p < len(w):
+        sid = w[p]; n, q = leb(p + 1); end = q + n
+        if sid == 1:
+            cnt, q = leb(q)
+            for _ in range(cnt):
+                q += 1  # 0x60
+                np, q = leb(q); q += np  # value types are one byte (no GC types here)
+                nr, q = leb(q); q += nr
+                params.append(np)
+        elif sid == 2:
+            cnt, q = leb(q)
+            for _ in range(cnt):
+                ln, q = leb(q); q += ln; ln, q = leb(q); q += ln
+                kind = w[q]; q += 1
+                if kind == 0:
+                    t, q = leb(q); ftypes.append(t)
+                elif kind in (1, 2):
+                    if kind == 1:
+                        q += 1
+                    fl, q = leb(q); _, q = leb(q)
+                    if fl & 1: _, q = leb(q)
+                elif kind == 3:
+                    q += 2
+                elif kind == 4:
+                    q += 1; _, q = leb(q)
+        elif sid == 3:
+            cnt, q = leb(q)
+            for _ in range(cnt):
+                t, q = leb(q); ftypes.append(t)
+        elif sid == 9:
+            cnt, q = leb(q)
+            for _ in range(cnt):
+                fl, q = leb(q)
+                if fl & 2 and not fl & 1:
+                    _, q = leb(q)  # table index
+                if not fl & 1:
+                    _, q = expr(q)  # offset
+                if fl & 3:
+                    q += 1  # element kind or reference type
+                k, q = leb(q)
+                for _ in range(k):
+                    if fl & 4:
+                        f, q = expr(q)
+                    else:
+                        f, q = leb(q)
+                    if f is not None:
+                        elems.append(f)
+        p = end
+    return max([params[ftypes[f]] for f in elems if f < len(ftypes)] or [0])
+
 # Functions above fork's driver (musl's src/process/wasm32/__gex_fork.c): the
 # unwind for a fork stops at the driver, so they keep no state.
 FORK_ROOTS = ['__gex_start', '__gex_start_c', '__gex_thread_start', '__gex_thread_c',
@@ -1303,13 +1381,18 @@ if FPCAST:
     if thunks and run([DYLINK, 'fpcast-prep', wasm, wasm]):
         die('gex-dylink fpcast-prep failed')
     cmd = [opt, wasm, '-g', '--strip-dwarf'] + feats + ['--fpcast-emu', '-o', wasm]
+    # as wide as the widest function in a table (binaryen names a call's
+    # need, but builds a narrower thunk for a wider function it holds)
+    widest = widest_table_params(wasm)
+    if widest > 16:
+        cmd[-2:-2] = ['--pass-arg=max-func-params@%d' % widest]
     p = subprocess.run(cmd, capture_output=True, text=True)
     # (binaryen names one function's need at a time: raise until it passes)
     for _ in range(64):
         m = re.findall(r'max-func-params needs to be at least (\d+)', p.stderr + p.stdout)
         if not (p.returncode and m):
             break
-        p = subprocess.run(cmd[:-2] + ['--pass-arg=max-func-params@' + str(max(map(int, m)) + 4), '-o', wasm],
+        p = subprocess.run(cmd[:-2] + ['--pass-arg=max-func-params@' + str(max(max(map(int, m)) + 4, widest)), '-o', wasm],
                            capture_output=True, text=True)
     if p.returncode:
         sys.stderr.write(p.stderr)
