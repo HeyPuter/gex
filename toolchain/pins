@@ -6,7 +6,7 @@
 # The musl fork the wasm32 sysroot is built from (toolchain/sysroot/build32.sh):
 # branch mw/gex-wasm32-slim.
 MUSL_REPO   := https://github.com/MercuryWorkshop/musl-wasm.git
-MUSL_COMMIT := aacfa4bb863afebc1806c91a678bac5de134c79b
+MUSL_COMMIT := 694e1f95271a7f9cc964998acf497978dcd77b03
 
 # The musl fork the LP64 (wasm64) sysroot is built from (toolchain/sysroot/build64.sh).
 MUSL64_REPO   := https://github.com/MercuryWorkshop/musl-wasm64.git
