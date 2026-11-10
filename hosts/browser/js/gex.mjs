@@ -1111,6 +1111,12 @@ function slotsNeeded(meta) {
  */
 function guestTrapSignal(err) {
   const m = String(err?.message ?? '');
+  // GEX_TRAP_STACK (`?trapstack=1`): a guest's trap's engine stack too, once,
+  // on one line (wasm function indices where names are stripped)
+  if (globalThis.GEX_TRAP_STACK && err && !err.gexTrapSaid) {
+    err.gexTrapSaid = true;
+    console.error(`[trapstack] ${String(err.stack ?? m).split('\n').map((l) => l.trim()).join(' | ')}`);
+  }
   if (err instanceof WebAssembly.RuntimeError) {
     if (/memory access out of bounds|index out of bounds|null function|signature mismatch|indirect call|table index/i.test(m)) return 11;
     if (/divide by zero|division by zero|integer overflow|divide result unrepresentable/i.test(m)) return 8;
