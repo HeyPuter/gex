@@ -13,6 +13,7 @@ import { native, trim, tail } from '../lib/native.mjs';
 export const meta = { hosts: ['node'], arches: ['x86'], timeout: 600 };
 
 const lines = (out) => out.split('\n').filter((l) => l.startsWith('outgrow ')).join('\n');
+const SAID = /\/g\/outgrow needs 64-bit memory \(a reservation of 0xe0000000 bytes did not fit\); it gets it from its next start/;
 const NOTICE = /crashed: SIGABRT\b[^\n]*; needs 64-bit memory; it will get it the next time it starts/;
 
 export default async function (t) {
@@ -36,9 +37,9 @@ export default async function (t) {
   for (const p of ['gex_browser.x86.shared.wasm', 'gex_kernel.x86.wasm', 'gex_browser.x86.m64.shared.wasm', 'seed.x86.m64.shared.wasm']) g.pub(p);
   const pc = await g.run(n.seed(), `${d}/outgrow`, ['twice', 'crash'], { files: { '/g/outgrow': `${d}/outgrow` }, argv0: '/g/outgrow', env: { GEX_SHARED: '1' }, timeout: 300000 });
   t.eq('page: the crash records it, and the next exec has a 64-bit memory', lines(pc.stdout), 'outgrow short\noutgrow child signal 6, record 1\noutgrow big high\noutgrow child exit 0, record 1', tail(pc.stderr));
-  // (this runner shows no crash notices, and an ending process's own lines
-  // may not outlive its Worker: the notice's reason is the kernel's, as
-  // natively, and the record is what the next exec shows)
+  // (this runner shows no crash notices: the line gex says as the record
+  // is made; the notice's reason is the kernel's, as natively)
+  t.check('page: gex says it needs 64-bit memory', SAID.test(pc.stdout + pc.stderr), tail(pc.stderr));
   const pf = await g.run(n.seed(), `${d}/outgrow`, ['twice', 'fallback'], { files: { '/g/outgrow': `${d}/outgrow` }, argv0: '/g/outgrow', env: { GEX_SHARED: '1' }, timeout: 300000 });
   t.eq('page: one that falls back and exits 0 is not recorded', lines(pf.stdout), 'outgrow fallback ok\noutgrow child exit 0, record none\noutgrow fallback ok\noutgrow child exit 0, record none', tail(pf.stderr));
   n.clean();

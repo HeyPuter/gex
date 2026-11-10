@@ -19,6 +19,7 @@ import { wow64 } from '../lib/winerun.mjs';
 export const meta = { hosts: ['node'], arches: ['x86'], timeout: 1500 };
 
 const SRC = fileURLToPath(new URL('../fixtures/wine/src/outgrow.c', import.meta.url));
+const SAID = /outgrow\.exe needs 64-bit memory \(a reservation of 0xe0000000 bytes did not fit\); it gets it from its next start/;
 const NOTICE = /needs 64-bit memory; it will get it the next time it starts/;
 const lines = (out) => out.replace(/\r/g, '').split('\n').filter((l) => l.startsWith('outgrow ')).join('\n');
 // The host file's user.gex.mem64, or null.
@@ -54,9 +55,9 @@ export default async function (t) {
   const p = await w.page(['/t/outgrow.exe', 'twice', 'crash'], { files: { '/t/outgrow.exe': exe }, name: 'page-crash', timeout: 600000 });
   t.eq('page: it crashes for want of room, and its next start has a 64-bit memory', lines(p.out),
     'outgrow short\noutgrow child exit c0000005\noutgrow big high\noutgrow child exit 00000000', w.detail(p));
-  // (run-node shows no crash notices, and an ending process's own lines
-  // may not outlive its Worker: the notice's reason is the kernel's, as
-  // natively, and the record is what the second start shows)
+  // (run-node shows no crash notices: the line gex says as the record is
+  // made; the notice's reason is the kernel's, as natively)
+  t.check('page: gex says it needs 64-bit memory', SAID.test(p.out), w.detail(p));
   const pf = await w.page(['/t/outgrow.exe', 'twice', 'fallback'], { files: { '/t/outgrow.exe': exe }, name: 'page-fallback', timeout: 600000 });
   t.eq('page: one that falls back and exits 0 is not recorded and keeps the lowered memory', lines(pf.out),
     'outgrow fallback ok\noutgrow child exit 00000000\noutgrow fallback ok\noutgrow child exit 00000000', w.detail(pf));
