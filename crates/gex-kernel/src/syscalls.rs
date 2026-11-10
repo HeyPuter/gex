@@ -12441,6 +12441,16 @@ fn signal_foreground(procs: &ProcTable, tty: &crate::tty::TtyRef, pid: i32, sign
 
 impl Kernel {
     fn sys_ioctl(&mut self, m: &mut GuestMem<'_>, fd: i32, req: u64, arg: u64) -> SysResult {
+        // TIOCGPTPEER (Linux 4.13): the slave of a master, opened with the
+        // flags in `arg` without its name, as openpty implementations try
+        // first (rustix's falls back to the name only on ENOSYS or EPERM).
+        const TIOCGPTPEER: u64 = 0x5441;
+        if req & 0xffff_ffff == TIOCGPTPEER {
+            if let Some(ptn) = self.fds.get(fd)?.handle.pty_peer() {
+                let allowed = 0o3 | oflags::O_NOCTTY | oflags::O_NONBLOCK | oflags::O_CLOEXEC;
+                return self.path_io().open_pty(&format!("/dev/pts/{ptn}"), arg & allowed).unwrap_or(Err(Errno::EIO));
+            }
+        }
         self.fd_io().ioctl(m, &self.procs, &self.tty, fd, req, arg)
     }
 
