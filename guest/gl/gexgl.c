@@ -4211,10 +4211,21 @@ static void host_realize(void) {
     }
 }
 
+/* eglGetError's answer: the last failure's code, EGL_SUCCESS once read. A
+   failing call must leave one, or a caller that asks why (khronos-egl's
+   Err(get_error().unwrap())) has nothing to report. */
+static int egl_error = 0x3000; /* EGL_SUCCESS */
+static unsigned egl_fail(int error) { egl_error = error; return EGL_FALSE; }
+static void *egl_fail_null(int error) { egl_error = error; return NULL; }
+#define EGL_NOT_INITIALIZED 0x3001
+#define EGL_BAD_NATIVE_PIXMAP 0x300A
+#define EGL_BAD_PARAMETER 0x300C
+#define EGL_BAD_SURFACE 0x300D
+
 unsigned eglInitialize(void *dpy, int *major, int *minor) {
     (void)dpy;
     if (ring_open() != 0) {
-        return EGL_FALSE;
+        return egl_fail(EGL_NOT_INITIALIZED);
     }
     /* EGL 1.5. The GL context itself is created later, from
        eglCreateContext, once eglBindAPI has said what it is for. */
@@ -4227,7 +4238,7 @@ unsigned eglInitialize(void *dpy, int *major, int *minor) {
 unsigned eglTerminate(void *dpy) { (void)dpy; return EGL_TRUE; }
 unsigned eglBindAPI(unsigned api) {
     if (api != 0x30A0u && api != 0x30A2u) /* EGL_OPENGL_ES_API / EGL_OPENGL_API */
-        return EGL_FALSE;
+        return egl_fail(EGL_BAD_PARAMETER);
     /* Only recorded here. The context is created from eglCreateContext, and
        the version strings are whatever the host answers for it -- selecting an
        identity here would be asserting a version rather than reporting one. */
@@ -4251,7 +4262,7 @@ unsigned eglGetConfigs(void *dpy, void **configs, int size, int *num) {
 
 unsigned eglGetConfigAttrib(void *dpy, void *config, int attr, int *value) {
     (void)dpy; (void)config;
-    if (!value) return EGL_FALSE;
+    if (!value) return egl_fail(EGL_BAD_PARAMETER);
     switch (attr) {
     case 0x3024: /* EGL_RED_SIZE */ *value = 8; break;
     case 0x3023: /* EGL_GREEN_SIZE */ *value = 8; break;
@@ -4725,7 +4736,7 @@ unsigned eglDestroyContext(void *dpy, void *ctx) {
 unsigned eglMakeCurrent(void *dpy, void *draw, void *read, void *ctx) {
     fbq_forget();
     fbq_known = 0;
-    if (!egl_ready) return EGL_FALSE;
+    if (!egl_ready) return egl_fail(EGL_NOT_INITIALIZED);
     /* A safety net for callers that reach a current context without going
        through this library's eglCreateContext. The latch inside makes it a
        no-op once the host context exists. */
@@ -4840,7 +4851,7 @@ unsigned eglSwapInterval(void *dpy, int interval) {
     egl_swap_interval = interval < 0 ? 0 : interval;
     return EGL_TRUE;
 }
-int eglGetError(void) { return 0x3000; /* EGL_SUCCESS */ }
+int eglGetError(void) { int e = egl_error; egl_error = 0x3000; return e; }
 
 void *eglGetCurrentDisplay(void) { return egl_current_display; }
 void *eglGetCurrentContext(void) { return egl_current_context; }
@@ -4851,7 +4862,7 @@ unsigned eglQueryAPI(void) { return egl_api; }
 
 unsigned eglQueryContext(void *dpy, void *ctx, int attr, int *value) {
     (void)dpy; (void)ctx;
-    if (!value) return EGL_FALSE;
+    if (!value) return egl_fail(EGL_BAD_PARAMETER);
     switch (attr) {
     case 0x3097: *value = (int)egl_api; break;       /* EGL_CONTEXT_CLIENT_TYPE */
     case 0x3098: *value = egl_context_major; break; /* EGL_CONTEXT_CLIENT_VERSION */
@@ -4864,7 +4875,7 @@ unsigned eglQueryContext(void *dpy, void *ctx, int attr, int *value) {
 
 unsigned eglQuerySurface(void *dpy, void *surface, int attr, int *value) {
     (void)dpy; (void)surface;
-    if (!value) return EGL_FALSE;
+    if (!value) return egl_fail(EGL_BAD_PARAMETER);
     switch (attr) {
     case 0x3057: *value = egl_surface_width; break;  /* EGL_WIDTH */
     case 0x3056: *value = egl_surface_height; break; /* EGL_HEIGHT */
@@ -4886,16 +4897,16 @@ unsigned eglSurfaceAttrib(void *dpy, void *surface, int attr, int value) {
     (void)dpy; (void)surface; (void)attr; (void)value; return EGL_TRUE;
 }
 unsigned eglBindTexImage(void *dpy, void *surface, int buffer) {
-    (void)dpy; (void)surface; (void)buffer; return EGL_FALSE;
+    (void)dpy; (void)surface; (void)buffer; return egl_fail(EGL_BAD_SURFACE);
 }
 unsigned eglReleaseTexImage(void *dpy, void *surface, int buffer) {
-    (void)dpy; (void)surface; (void)buffer; return EGL_FALSE;
+    (void)dpy; (void)surface; (void)buffer; return egl_fail(EGL_BAD_SURFACE);
 }
 unsigned eglCopyBuffers(void *dpy, void *surface, void *pixmap) {
-    (void)dpy; (void)surface; (void)pixmap; return EGL_FALSE;
+    (void)dpy; (void)surface; (void)pixmap; return egl_fail(EGL_BAD_NATIVE_PIXMAP);
 }
 void *eglCreatePixmapSurface(void *dpy, void *config, void *pixmap, const int *attrs) {
-    (void)dpy; (void)config; (void)pixmap; (void)attrs; return NULL;
+    (void)dpy; (void)config; (void)pixmap; (void)attrs; return egl_fail_null(EGL_BAD_NATIVE_PIXMAP);
 }
 void *eglCreatePlatformWindowSurface(void *dpy, void *config, void *window,
                                      const intptr_t *attrs) {
@@ -4907,33 +4918,33 @@ void *eglCreatePlatformWindowSurface(void *dpy, void *config, void *window,
 }
 void *eglCreatePlatformPixmapSurface(void *dpy, void *config, void *pixmap,
                                      const intptr_t *attrs) {
-    (void)dpy; (void)config; (void)pixmap; (void)attrs; return NULL;
+    (void)dpy; (void)config; (void)pixmap; (void)attrs; return egl_fail_null(EGL_BAD_NATIVE_PIXMAP);
 }
 void *eglCreatePbufferFromClientBuffer(void *dpy, unsigned type, void *buffer,
                                        void *config, const int *attrs) {
-    (void)dpy; (void)type; (void)buffer; (void)config; (void)attrs; return NULL;
+    (void)dpy; (void)type; (void)buffer; (void)config; (void)attrs; return egl_fail_null(EGL_BAD_PARAMETER);
 }
 void *eglCreateImage(void *dpy, void *ctx, unsigned target, void *buffer,
                      const intptr_t *attrs) {
-    (void)dpy; (void)ctx; (void)target; (void)buffer; (void)attrs; return NULL;
+    (void)dpy; (void)ctx; (void)target; (void)buffer; (void)attrs; return egl_fail_null(EGL_BAD_PARAMETER);
 }
 unsigned eglDestroyImage(void *dpy, void *image) {
-    (void)dpy; (void)image; return EGL_FALSE;
+    (void)dpy; (void)image; return egl_fail(EGL_BAD_PARAMETER);
 }
 void *eglCreateSync(void *dpy, unsigned type, const intptr_t *attrs) {
-    (void)dpy; (void)type; (void)attrs; return NULL;
+    (void)dpy; (void)type; (void)attrs; return egl_fail_null(EGL_BAD_PARAMETER);
 }
 unsigned eglDestroySync(void *dpy, void *sync) {
-    (void)dpy; (void)sync; return EGL_FALSE;
+    (void)dpy; (void)sync; return egl_fail(EGL_BAD_PARAMETER);
 }
 int eglClientWaitSync(void *dpy, void *sync, int flags, uint64_t timeout) {
     (void)dpy; (void)sync; (void)flags; (void)timeout; return 0x30F5; /* EGL_TIMEOUT_EXPIRED */
 }
 unsigned eglGetSyncAttrib(void *dpy, void *sync, int attr, intptr_t *value) {
-    (void)dpy; (void)sync; (void)attr; (void)value; return EGL_FALSE;
+    (void)dpy; (void)sync; (void)attr; (void)value; return egl_fail(EGL_BAD_PARAMETER);
 }
 unsigned eglWaitSync(void *dpy, void *sync, int flags) {
-    (void)dpy; (void)sync; (void)flags; return EGL_FALSE;
+    (void)dpy; (void)sync; (void)flags; return egl_fail(EGL_BAD_PARAMETER);
 }
 
 const char *eglQueryString(void *dpy, int name) {
