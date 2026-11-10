@@ -9,8 +9,9 @@
 //! before it, each with a checksum: a checkpoint (every record) and then a
 //! segment per generation since (the records that changed, and the paths
 //! that no longer have one). A record is a path's difference from the
-//! sources: gone, a directory, a symlink, a mode, or a file with its bytes
-//! (a small one) or its blocks in the store.
+//! sources: gone, a directory, a symlink, a file of the sources with its
+//! mode and extended attributes changed (its bytes still the sources'), or
+//! a file with its bytes (a small one) or its blocks in the store.
 //!
 //! A generation is written at `sync(2)`, `syncfs`, `fsync`, `fdatasync`, the
 //! page's sync, and by the write-back ([`tick`]) once something has waited
@@ -97,8 +98,15 @@ enum Rec {
     Gone,
     Dir { mode: u32, mtime: i64, xattrs: Xattrs },
     Link { target: String },
-    /// A file of the sources, its mode changed.
+    /// A file of the sources, its mode changed (read from older stores;
+    /// [`Rec::Attrs`] is written instead).
     Mode { mode: u32 },
+    /// A file of the sources, its mode or extended attributes changed, its
+    /// bytes not, or a file of a layer laid after boot that has extended
+    /// attributes: laid over the sources' file, or over the layer's when it
+    /// is laid again ([`late_laid`]), so a site's newer file keeps what was
+    /// set on the old one (a `user.gex.mem64` record).
+    Attrs { mode: u32, xattrs: Xattrs },
     /// `ino` names the file among this generation's records (hard links).
     File { ino: u64, mode: u32, mtime: i64, body: Body, xattrs: Xattrs },
 }
@@ -108,7 +116,7 @@ enum Pre {
     Gone,
     Dir { mode: u32, mtime: i64, xattrs: Xattrs },
     Link { target: String },
-    Mode { mode: u32 },
+    Attrs { mode: u32, xattrs: Xattrs },
     File { node: Arc<FileNode>, mode: u32, xattrs: Xattrs },
 }
 
@@ -154,6 +162,11 @@ impl W {
             Rec::Mode { mode } => {
                 self.u8(3);
                 self.u32(*mode);
+            }
+            Rec::Attrs { mode, xattrs } => {
+                self.u8(5);
+                self.u32(*mode);
+                self.xattrs(xattrs);
             }
             Rec::File { ino, mode, mtime, body, xattrs } => {
                 self.u8(4);
@@ -223,6 +236,7 @@ impl R<'_> {
             1 => Rec::Dir { mode: self.u32()?, mtime: self.u64()? as i64, xattrs: self.xattrs()? },
             2 => Rec::Link { target: self.str()? },
             3 => Rec::Mode { mode: self.u32()? },
+            5 => Rec::Attrs { mode: self.u32()?, xattrs: self.xattrs()? },
             4 => {
                 let (ino, mode, mtime, xattrs) = (self.u64()?, self.u32()?, self.u64()? as i64, self.xattrs()?);
                 let body = match self.u8()? {
@@ -304,6 +318,21 @@ struct State {
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
+
+/// [`Rec::Attrs`] kept for files the boot did not find: a layer laid after
+/// boot (a site's tar added once the system runs) lays them again later,
+/// and [`late_laid`] puts what was kept on each as it does. Taken under the
+/// tree's lock, never the other way round; never under [`STATE`] first.
+static LATE: Mutex<BTreeMap<String, (u32, Xattrs)>> = Mutex::new(BTreeMap::new());
+
+/// A layer laid `path` (inode `ino`) after boot: the mode and extended
+/// attributes kept for it ([`LATE`]), if any, go on it. Called with the
+/// tree locked, by the laying itself.
+pub(super) fn late_laid(inner: &mut Inner, path: &str, ino: u64) {
+    let Some((mode, xattrs)) = LATE.lock().unwrap().remove(path) else { return };
+    let _ = inner.chmod(path, mode);
+    set_xattrs(inner, ino, &xattrs);
+}
 /// Generations written, records put, paths dropped (k_fs_persist_stats).
 pub static GENS: AtomicU64 = AtomicU64::new(0);
 pub static PUTS: AtomicU64 = AtomicU64::new(0);
@@ -370,8 +399,12 @@ fn sig_dir(mode: u32, x: &Xattrs) -> u64 {
 fn sig_link(t: &str) -> u64 {
     fnv(fnv(FNV0, &[2]), t.as_bytes())
 }
-fn sig_file_seed(mode: u32) -> u64 {
-    fnv(fnv(FNV0, &[3]), &mode.to_le_bytes())
+fn sig_file_seed(mode: u32, x: &Xattrs) -> u64 {
+    let mut h = fnv(fnv(FNV0, &[3]), &mode.to_le_bytes());
+    for (k, v) in x {
+        h = fnv(fnv(h, k.as_bytes()), v);
+    }
+    h
 }
 
 fn within(p: &str, at: &str) -> bool {
@@ -404,7 +437,7 @@ fn seed_of(fs: &TmpFs) -> HashMap<String, u64> {
         let s = match n {
             Node::Dir => sig_dir(mode_of(&inner, p, n), &xattrs_of(&inner, ino)),
             Node::Symlink(t) => sig_link(t),
-            Node::File(_) => sig_file_seed(mode_of(&inner, p, n)),
+            Node::File(f) => sig_file_seed(mode_of(&inner, p, n), &xattrs_of(&inner, f.ino)),
             Node::Socket => continue,
         };
         out.insert(p.clone(), s);
@@ -446,14 +479,26 @@ impl State {
                 Node::Socket => {}
                 Node::File(f) => {
                     let xattrs = xattrs_of(&inner, f.ino);
-                    if f.written.load(Ordering::Relaxed) || !xattrs.is_empty() {
+                    if f.written.load(Ordering::Relaxed) {
                         out.push((p.clone(), Pre::File { node: Arc::clone(f), mode, xattrs }));
-                    } else if seed.is_some_and(|&s| s != sig_file_seed(mode)) {
-                        out.push((p.clone(), Pre::Mode { mode }));
+                    } else if let Some(&s) = seed {
+                        if s != sig_file_seed(mode, &xattrs) {
+                            out.push((p.clone(), Pre::Attrs { mode, xattrs }));
+                        }
+                    } else if !xattrs.is_empty() {
+                        // (a layer laid after boot: its bytes are the
+                        // layer's, laid again by the next boot's)
+                        out.push((p.clone(), Pre::Attrs { mode, xattrs }));
                     }
                     // Not written and not the sources': a layer laid after
                     // boot, laid again by the next one.
                 }
+            }
+        }
+        // Kept for a layer not laid again yet.
+        for (p, (mode, xattrs)) in LATE.lock().unwrap().iter() {
+            if !inner.nodes.contains_key(p) && !self.excluded(p) {
+                out.push((p.clone(), Pre::Attrs { mode: *mode, xattrs: xattrs.clone() }));
             }
         }
         // Removed: the topmost of what the sources had.
@@ -585,7 +630,7 @@ fn sig_of(pre: &Pre) -> u64 {
         Pre::Gone => fnv(FNV0, &[9]),
         Pre::Dir { mode, xattrs, .. } => sig_dir(*mode, xattrs),
         Pre::Link { target } => sig_link(target),
-        Pre::Mode { mode } => fnv(sig_file_seed(*mode), &[7]),
+        Pre::Attrs { mode, xattrs } => fnv(sig_file_seed(*mode, xattrs), &[8]),
         Pre::File { node, mode, xattrs } => {
             let mut h = fnv(FNV0, &[4]);
             h = fnv(h, &(Arc::as_ptr(node) as usize as u64).to_le_bytes());
@@ -609,7 +654,7 @@ fn take(pre: &Pre) -> Rec {
         Pre::Gone => Rec::Gone,
         Pre::Dir { mode, mtime, xattrs } => Rec::Dir { mode: *mode, mtime: *mtime, xattrs: xattrs.clone() },
         Pre::Link { target } => Rec::Link { target: target.clone() },
-        Pre::Mode { mode } => Rec::Mode { mode: *mode },
+        Pre::Attrs { mode, xattrs } => Rec::Attrs { mode: *mode, xattrs: xattrs.clone() },
         Pre::File { node, mode, xattrs } => {
             let mtime = node.mtime.load(Ordering::Relaxed);
             let lazy = node.lazy.lock().unwrap().as_ref().map(|l| (l.url.clone(), l.size));
@@ -777,6 +822,18 @@ fn apply(fs: &TmpFs, recs: &BTreeMap<String, Rec>, used: &mut Vec<bool>) {
                     let _ = inner.chmod(p, *mode);
                 }
             }
+            Rec::Attrs { mode, xattrs } => match inner.nodes.get(p.as_str()) {
+                Some(Node::File(f)) => {
+                    let ino = f.ino;
+                    let _ = inner.chmod(p, *mode);
+                    set_xattrs(&mut inner, ino, xattrs);
+                }
+                // Not laid yet: a layer after boot lays it.
+                None => {
+                    LATE.lock().unwrap().insert(p.clone(), (*mode, xattrs.clone()));
+                }
+                Some(_) => {}
+            },
             Rec::Dir { mode, mtime, xattrs } => {
                 if !matches!(inner.nodes.get(p.as_str()), Some(Node::Dir) | None) {
                     remove_tree(&mut inner, p);
@@ -947,6 +1004,7 @@ pub fn on() -> bool {
 #[cfg(test)]
 pub fn reset() {
     *STATE.lock().unwrap() = None;
+    LATE.lock().unwrap().clear();
     blocks::reset();
 }
 
@@ -1086,6 +1144,95 @@ mod tests {
         assert_eq!(STATE.lock().unwrap().as_ref().unwrap().sb.gen, gen - 1);
         check1(&fs);
         assert!(read(&fs, "home/after").is_none());
+        reset();
+    }
+
+    /// Extended attributes set on a file of the sources (a program's
+    /// `user.gex.mem64` record) are kept across boots without its bytes:
+    /// the next boot's sources, newer bytes, keep them, as does a written
+    /// file; a removed attribute stays removed.
+    #[test]
+    #[ignore]
+    fn attributes_on_the_sources_files_are_kept_without_their_bytes() {
+        use crate::vfs::XattrOp;
+        STORE_FILE.lock().unwrap().clear();
+        let get = |fs: &TmpFs, p: &str| {
+            let mut b = [0u8; 8];
+            fs.xattr(p, XattrOp::Get { name: "user.gex.mem64", buf: &mut b }).ok().map(|n| b[..n].to_vec())
+        };
+        let set = |fs: &TmpFs, p: &str| fs.xattr(p, XattrOp::Set { name: "user.gex.mem64", value: b"1", flags: 0 }).unwrap();
+        let fs = boot();
+        start(&fs, vec![]);
+        set(&fs, "usr/bin/tool");
+        set(&fs, "etc/big");
+        write(&fs, "home-file", b"mine");
+        set(&fs, "home-file");
+        // (the write-back's tick, not only an explicit sync, sees it)
+        let seen = STATE.lock().unwrap().as_ref().unwrap().seen;
+        assert_ne!(META.load(Ordering::Relaxed), seen, "setting an attribute is a change to keep");
+        sync().unwrap();
+
+        // The next boot's sources: a newer tool.
+        let fs = boot();
+        fs.add_file("usr/bin/tool", b"#!v2".to_vec());
+        assert_eq!(start(&fs, vec![]), Found::Restored);
+        assert_eq!(get(&fs, "usr/bin/tool").as_deref(), Some(&b"1"[..]));
+        assert_eq!(read(&fs, "usr/bin/tool").unwrap(), b"#!v2", "the sources' bytes, not a kept copy");
+        assert_eq!(get(&fs, "etc/big").as_deref(), Some(&b"1"[..]));
+        assert_eq!(read(&fs, "etc/big").unwrap(), vec![5u8; 3000]);
+        assert_eq!(get(&fs, "home-file").as_deref(), Some(&b"1"[..]));
+        assert_eq!(read(&fs, "home-file").unwrap(), b"mine");
+
+        // Removed, and kept removed.
+        fs.xattr("usr/bin/tool", XattrOp::Remove { name: "user.gex.mem64" }).unwrap();
+        sync().unwrap();
+        let fs = boot();
+        assert_eq!(start(&fs, vec![]), Found::Restored);
+        assert_eq!(get(&fs, "usr/bin/tool"), None);
+        assert_eq!(get(&fs, "etc/big").as_deref(), Some(&b"1"[..]));
+        reset();
+    }
+
+    /// A layer laid after boot (a site's tar added once the system runs):
+    /// what was set on its files is kept, without their bytes, through a
+    /// sync made before the layer is laid again and one made after.
+    #[test]
+    #[ignore]
+    fn attributes_on_a_late_layer_are_kept_until_it_is_laid_again() {
+        use crate::vfs::XattrOp;
+        STORE_FILE.lock().unwrap().clear();
+        let get = |fs: &TmpFs, p: &str| {
+            let mut b = [0u8; 8];
+            fs.xattr(p, XattrOp::Get { name: "user.gex.mem64", buf: &mut b }).ok().map(|n| b[..n].to_vec())
+        };
+        let fs = boot();
+        start(&fs, vec![]);
+        fs.mkdir("opt", 0o755).unwrap();
+        fs.add_file("opt/app", b"layer-1".to_vec());
+        fs.xattr("opt/app", XattrOp::Set { name: "user.gex.mem64", value: b"1", flags: 0 }).unwrap();
+        sync().unwrap();
+
+        // Booted, the layer not laid yet: a sync keeps the record.
+        let fs = boot();
+        assert_eq!(start(&fs, vec![]), Found::Restored);
+        assert_eq!(get(&fs, "opt/app"), None);
+        write(&fs, "home-file", b"mine");
+        sync().unwrap();
+
+        // Booted again, the layer (newer) laid after.
+        let fs = boot();
+        assert_eq!(start(&fs, vec![]), Found::Restored);
+        fs.mkdir("opt", 0o755).ok();
+        fs.add_file("opt/app", b"layer-2".to_vec());
+        assert_eq!(get(&fs, "opt/app").as_deref(), Some(&b"1"[..]));
+        assert_eq!(read(&fs, "opt/app").unwrap(), b"layer-2", "the layer's bytes, not a kept copy");
+        sync().unwrap();
+        let fs = boot();
+        assert_eq!(start(&fs, vec![]), Found::Restored);
+        fs.mkdir("opt", 0o755).ok();
+        fs.add_file("opt/app", b"layer-3".to_vec());
+        assert_eq!(get(&fs, "opt/app").as_deref(), Some(&b"1"[..]));
+        assert_eq!(read(&fs, "opt/app").unwrap(), b"layer-3");
         reset();
     }
 
