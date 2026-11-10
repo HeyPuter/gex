@@ -7473,6 +7473,26 @@ pub struct FreeCall {
 /// the 32-bit ABI's `pread64`, `pwrite64`,
 /// `_llseek`, `fcntl64`, `mmap2` and old `mmap` too, translated as the full
 /// call translates them.
+/// `TIOCGPTPEER` (Linux 4.13): the slave of the pty master `fd`, opened
+/// with the flags in `arg` and without its name, as openpty implementations
+/// try first (rustix's falls back to the name only on ENOSYS or EPERM).
+/// `None` for any other request, or a descriptor that is not a master. The
+/// slave of a master still locked (`TIOCSPTLCK`) is refused, as its name is.
+/// The full call and the free path both answer it here.
+pub fn pty_peer_ioctl(fds: &FdTable, path: &PathIo<'_>, fd: i32, req: u64, arg: u64) -> Option<SysResult> {
+    const TIOCGPTPEER: u64 = 0x5441;
+    if req & 0xffff_ffff != TIOCGPTPEER {
+        return None;
+    }
+    let ptn = match fds.get(fd) {
+        Ok(f) => f.handle.pty_peer()?,
+        Err(e) => return Some(Err(e)),
+    };
+    // Linux takes the access mode and these, and ignores any other bit.
+    let allowed = 0o3 | oflags::O_NOCTTY | oflags::O_NONBLOCK | oflags::O_CLOEXEC;
+    Some(path.open_pty(&format!("/dev/pts/{ptn}"), arg & allowed).unwrap_or(Err(Errno::EIO)))
+}
+
 pub fn free_class(m: &GuestMem<'_>, ctx_addr: u64, compat: bool) -> Option<FreeCall> {
     free_class_of(m, call_regs(m, ctx_addr, compat), compat)
 }
@@ -7690,7 +7710,10 @@ pub fn free_call(f: &Free<'_>, m: &mut GuestMem<'_>, ctx_addr: u64, call: FreeCa
         }
         r
     } else if n == nr::IOCTL {
-        let r = f.io.ioctl(m, f.procs, f.tty, a[0] as i32, a[1], a[2]);
+        let r = match pty_peer_ioctl(f.io.fds, &f.path, a[0] as i32, a[1], a[2]) {
+            Some(r) => r,
+            None => f.io.ioctl(m, f.procs, f.tty, a[0] as i32, a[1], a[2]),
+        };
         // A terminal's request may have signalled this process's own group
         // (`TIOCSIG`, `TIOCSWINSZ`): in now, to be delivered at the call's
         // end as the full call's are.
@@ -12454,15 +12477,8 @@ fn signal_foreground(procs: &ProcTable, tty: &crate::tty::TtyRef, pid: i32, sign
 
 impl Kernel {
     fn sys_ioctl(&mut self, m: &mut GuestMem<'_>, fd: i32, req: u64, arg: u64) -> SysResult {
-        // TIOCGPTPEER (Linux 4.13): the slave of a master, opened with the
-        // flags in `arg` without its name, as openpty implementations try
-        // first (rustix's falls back to the name only on ENOSYS or EPERM).
-        const TIOCGPTPEER: u64 = 0x5441;
-        if req & 0xffff_ffff == TIOCGPTPEER {
-            if let Some(ptn) = self.fds.get(fd)?.handle.pty_peer() {
-                let allowed = 0o3 | oflags::O_NOCTTY | oflags::O_NONBLOCK | oflags::O_CLOEXEC;
-                return self.path_io().open_pty(&format!("/dev/pts/{ptn}"), arg & allowed).unwrap_or(Err(Errno::EIO));
-            }
+        if let Some(r) = pty_peer_ioctl(&self.fds, &self.path_io(), fd, req, arg) {
+            return r;
         }
         self.fd_io().ioctl(m, &self.procs, &self.tty, fd, req, arg)
     }
