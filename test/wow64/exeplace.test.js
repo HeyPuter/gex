@@ -1,11 +1,12 @@
 // A 64-bit program that can move, in a 64-bit page memory (the arena gex
 // gives above 4 GiB, filled top down), goes top down with the DLLs rather
 // than at its own base (0x140000000), which cut the arena in two; one with
-// no relocations stays at its base. And GlobalMemoryStatusEx's available virtual memory is the free
+// no relocations stays at its base, also when marked dynamic base (it cannot
+// move all the same). And GlobalMemoryStatusEx's available virtual memory is the free
 // address space of the user range (what VirtualQuery shows), not the total
 // less the working set; in the page's 64-bit memory that leaves out
 // [2 GiB, 4 GiB), gex's own space, which shows as reserved.
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { wow64 } from '../lib/winerun.mjs';
@@ -25,6 +26,15 @@ export default async function (t) {
   const w = wow64(t);
   const moving = await w.mingw('exeplace', { x64: true, src: SRC, flags: ['-Wl,--dynamicbase,--high-entropy-va'], out: 'exeplace.exe' });
   const fixed = await w.mingw('exeplace', { x64: true, src: SRC, flags: ['-Wl,--disable-dynamicbase,--disable-reloc-section'], out: 'exeplace-fixed.exe' });
+  // relocations stripped yet marked dynamic base, as some installers are
+  // (ld drops the mark with the relocations: set in the header after)
+  const fixedDyn = join(w.work, 'exeplace-fixed-dyn.exe');
+  {
+    const pe = readFileSync(fixed);
+    const dllChars = pe.readUInt32LE(0x3c) + 24 + 70;
+    pe.writeUInt16LE(pe.readUInt16LE(dllChars) | 0x40, dllChars);
+    writeFileSync(fixedDyn, pe);
+  }
   // the avail is the free space, give or take what changed between the two
   // looks (the walk is cached for a second; 64 MiB of slack)
   const truthful = (r) => r.avail < r.total && r.avail + (64n << 20n) >= r.free && r.avail <= r.free + (64n << 20n) && r.largest <= r.free;
@@ -49,5 +59,9 @@ export default async function (t) {
   const fr = parse(f.out);
   t.say(`page mem64, no relocations: ${say(fr)}`);
   t.check('page mem64: a program with no relocations stays at its base', fr?.base === BASE, w.detail(f));
+  const fd = await w.page(['/t/exeplace-fixed-dyn.exe'], { files: { '/t/exeplace-fixed-dyn.exe': fixedDyn }, name: 'page-m64-fixed-dyn', timeout: 600000 });
+  const fdr = parse(fd.out);
+  t.say(`page mem64, no relocations, dynamic base: ${say(fdr)}`);
+  t.check('page mem64: one with no relocations marked dynamic base stays at its base too', fdr?.base === BASE, w.detail(fd));
   w.clean();
 }
