@@ -3970,10 +3970,15 @@ void *eglGetDisplay(void *native) {
     return (void *)1;
 }
 
+/* EGL_PLATFORM_XCB_EXT's screen, from EGL_PLATFORM_XCB_SCREEN_EXT. */
+static int egl_native_xcb_screen;
+
 void *eglGetPlatformDisplay(unsigned platform, void *native, const intptr_t *attrs) {
-    (void)attrs;
     egl_native_display = native;
     egl_native_platform = platform;
+    egl_native_xcb_screen = 0;
+    for (const intptr_t *a = attrs; a && a[0] != 0x3038 /* EGL_NONE */; a += 2)
+        if (a[0] == 0x31DE /* EGL_PLATFORM_XCB_SCREEN_EXT */) egl_native_xcb_screen = (int)a[1];
     return (void *)1;
 }
 
@@ -4006,6 +4011,99 @@ static void *gexgl_x11_client_display(void) {
     return gexgl_x11_symbol_source() ? egl_native_display : NULL;
 }
 
+/* The same three questions for an XCB client (EGL_PLATFORM_XCB_EXT), which
+ * hands over an `xcb_connection_t *` and need not have Xlib at all: x11rb,
+ * and so wgpu under gpui, talks to the server through libxcb alone. The
+ * platform is explicit, so the pointer is known to be a connection; libxcb is
+ * found with RTLD_NOLOAD for the reason given above.
+ *
+ * libxcb's structures are the X protocol's wire layout, which does not change,
+ * so the few fields needed are declared here rather than taken from headers
+ * the guest's toolchain may not have. A request that fails comes back as an
+ * error rather than a call to an error handler, so nothing here can end the
+ * process. */
+struct gexgl_xcb_geometry_reply {
+    uint8_t response_type, depth;
+    uint16_t sequence;
+    uint32_t length, root;
+    int16_t x, y;
+    uint16_t width, height, border_width;
+};
+struct gexgl_xcb_tree_reply {
+    uint8_t response_type, pad0;
+    uint16_t sequence;
+    uint32_t length, root, parent;
+    uint16_t children_len;
+};
+struct gexgl_xcb_screen {
+    uint32_t root, default_colormap, white_pixel, black_pixel, input_masks;
+    uint16_t width, height, mm_width, mm_height, min_maps, max_maps;
+    uint32_t root_visual;
+};
+struct gexgl_xcb_cookie {
+    unsigned sequence;
+};
+struct gexgl_xcb_screen_iterator {
+    struct gexgl_xcb_screen *data;
+    int rem, index;
+};
+
+static void *gexgl_xcb_client_connection(void **xcb) {
+    if (!egl_native_display || egl_native_platform != 0x31DCu) return NULL;
+    *xcb = dlopen("libxcb.so.1", RTLD_LAZY | RTLD_NOLOAD);
+    return *xcb ? egl_native_display : NULL;
+}
+
+/* Returns 1 with the size if `win` is a window on the client's connection. */
+static int gexgl_xcb_window_size(void *c, void *xcb, uint32_t win, int *width, int *height) {
+    struct gexgl_xcb_cookie (*get)(void *, uint32_t) = dlsym(xcb, "xcb_get_geometry");
+    struct gexgl_xcb_geometry_reply *(*reply)(void *, struct gexgl_xcb_cookie, void **) =
+        dlsym(xcb, "xcb_get_geometry_reply");
+    if (!get || !reply) return 0;
+    void *error = NULL;
+    struct gexgl_xcb_geometry_reply *r = reply(c, get(c, win), &error);
+    free(error);
+    if (!r) return 0;
+    const int ok = r->width && r->height;
+    if (ok) {
+        *width = r->width;
+        *height = r->height;
+    }
+    free(r);
+    return ok;
+}
+
+static uint32_t gexgl_xcb_toplevel(void *c, void *xcb, uint32_t win) {
+    struct gexgl_xcb_cookie (*query)(void *, uint32_t) = dlsym(xcb, "xcb_query_tree");
+    struct gexgl_xcb_tree_reply *(*reply)(void *, struct gexgl_xcb_cookie, void **) =
+        dlsym(xcb, "xcb_query_tree_reply");
+    if (!query || !reply) return win;
+    for (int depth = 0; depth < 32; depth++) {
+        void *error = NULL;
+        struct gexgl_xcb_tree_reply *r = reply(c, query(c, win), &error);
+        free(error);
+        if (!r) break;
+        const uint32_t parent = r->parent, root = r->root;
+        free(r);
+        if (!parent || parent == root) break;
+        win = parent;
+    }
+    return win;
+}
+
+static int gexgl_xcb_default_visual(void *c, void *xcb) {
+    const void *(*get_setup)(void *) = dlsym(xcb, "xcb_get_setup");
+    struct gexgl_xcb_screen_iterator (*roots)(const void *) =
+        dlsym(xcb, "xcb_setup_roots_iterator");
+    void (*next)(struct gexgl_xcb_screen_iterator *) = dlsym(xcb, "xcb_screen_next");
+    if (!get_setup || !roots || !next) return 0;
+    const void *setup = get_setup(c);
+    if (!setup) return 0;
+    struct gexgl_xcb_screen_iterator it = roots(setup);
+    for (int i = 0; i < egl_native_xcb_screen && it.rem; i++) next(&it);
+    return it.rem && it.data ? (int)it.data->root_visual : 0;
+}
+
 /* The X visual an EGL config corresponds to.
  *
  * EGL on X11 has to answer EGL_NATIVE_VISUAL_ID with a visual the X server
@@ -4030,6 +4128,8 @@ static int egl_native_visual_id = -1;
 static int gexgl_x11_default_visual(void) {
     if (egl_native_visual_id >= 0) return egl_native_visual_id;
     egl_native_visual_id = 0;
+    void *xcb = NULL, *connection = gexgl_xcb_client_connection(&xcb);
+    if (connection) return egl_native_visual_id = gexgl_xcb_default_visual(connection, xcb);
     void *xlib = gexgl_x11_symbol_source();
     if (!xlib) return 0;
     void *(*open_display)(const char *) = dlsym(xlib, "XOpenDisplay");
@@ -4217,6 +4317,9 @@ static int gexgl_x11_window_size(void *win, int *width, int *height) {
        gets BadWindow for a window that certainly exists -- measured, not
        supposed. Requests on one connection are ordered, so the client's own
        sees it. */
+    void *xcb = NULL, *connection = gexgl_xcb_client_connection(&xcb);
+    if (connection)
+        return gexgl_xcb_window_size(connection, xcb, (uint32_t)(uintptr_t)win, width, height);
     void *display = gexgl_x11_client_display();
     void *xlib = gexgl_x11_symbol_source();
     if (!display || !xlib) return 0;
@@ -4254,6 +4357,8 @@ static unsigned long gexgl_x11_toplevel(void *win) {
     void *display = gexgl_x11_client_display();
     void *xlib = gexgl_x11_symbol_source();
     unsigned long w = (unsigned long)(uintptr_t)win;
+    void *xcb = NULL, *connection = gexgl_xcb_client_connection(&xcb);
+    if (connection) return gexgl_xcb_toplevel(connection, xcb, (uint32_t)w);
     if (!display || !xlib) return w;
     int (*query_tree)(void *, unsigned long, unsigned long *, unsigned long *,
                       unsigned long **, unsigned *) = dlsym(xlib, "XQueryTree");
@@ -4795,6 +4900,9 @@ void *eglCreatePixmapSurface(void *dpy, void *config, void *pixmap, const int *a
 void *eglCreatePlatformWindowSurface(void *dpy, void *config, void *window,
                                      const intptr_t *attrs) {
     (void)attrs;
+    /* EGL_EXT_platform_xcb's window is a pointer to the xcb_window_t. */
+    if (egl_native_platform == 0x31DCu && window)
+        window = (void *)(uintptr_t)*(const uint32_t *)window;
     return eglCreateWindowSurface(dpy, config, window, NULL);
 }
 void *eglCreatePlatformPixmapSurface(void *dpy, void *config, void *pixmap,
@@ -4849,7 +4957,8 @@ const char *eglQueryString(void *dpy, int name) {
                      "EGL_KHR_no_config_context"
                    : "EGL_EXT_client_extensions EGL_EXT_platform_base "
                      "EGL_KHR_client_get_all_proc_addresses "
-                     "EGL_EXT_platform_wayland EGL_KHR_platform_wayland";
+                     "EGL_EXT_platform_wayland EGL_KHR_platform_wayland "
+                     "EGL_EXT_platform_xcb";
     case 0x308D: return "OpenGL OpenGL_ES"; /* EGL_CLIENT_APIS */
     default: return "";
     }
