@@ -72,18 +72,31 @@ const PHASES = [
     t.check('network: the last one set, a Wisp', v.sys.network instanceof wisp.Wisp && v.sys.network.url === 'wss://wisp.example/', String(v.sys.network?.url));
   } },
   { blocks: [8], pre: 'booted', check: async (t, v) => {
-    const r = await t.timeout(v.sys.run(['sh', '-c', guestLine(BLOCKS[8], 'exec 3<>')], { env: { PATH: '/usr/bin:/bin' } }), 30000, 'notify');
+    // The guest half, as the README's comment has it.
+    const r = await t.timeout(v.sys.run(['sh', '-c', guestLine(BLOCKS[8], 'perl ')], { env: { PATH: '/usr/bin:/bin' } }), 30000, 'unix client');
+    t.eq('unix sockets: a program\'s connect to sys.listen\'s, echoed', [r.code, r.stdout, r.stderr], [0, 'hello\n', '']);
+    t.eq('unix sockets: the socket file', (await v.fs.stat('/run/app.sock', { follow: false })).type, 'socket');
+  } },
+  { blocks: [9], pre: 'booted', prep: async (t, sys, fs) => {
+    // The guest server the block connects to, as the README's comment has it.
+    sys.spawn(['sh', '-c', guestLine(BLOCKS[9], 'perl ')], { env: { PATH: '/usr/bin:/bin' } });
+    await t.until(async () => (await fs.stat('/run/myd.sock').catch(() => null))?.type === 'socket', 'the guest server listens', 30000);
+  }, check: async (t, v) => {
+    t.eq('unix sockets: sys.connect to a program\'s server', v.reply, 'HELLO\n');
+  } },
+  { blocks: [10], pre: 'booted', check: async (t, v) => {
+    const r = await t.timeout(v.sys.run(['sh', '-c', guestLine(BLOCKS[10], 'exec 3<>')], { env: { PATH: '/usr/bin:/bin' } }), 30000, 'notify');
     t.eq('host calls: the guest reads "\\0true"', [r.code, r.stdout], [0, '\0true']);
     t.eq('host calls: notify ran', v.calls.showToast, 'built');
     v.off();
     t.eq('host calls: unregistered', v.sys.hostCalls.names().includes('notify'), false);
   } },
-  { blocks: [10], windows: true, pre: 'new', after: [9], boot: true, check: async (t, v) => {
+  { blocks: [12], windows: true, pre: 'new', after: [11], boot: true, check: async (t, v) => {
     t.check('GL: a MesaGl before boot, beside its windows', !!v.gl && !!v.hw, '');
     v.button.onclick();
     t.check('audio: the click made a WebAudio', true, '');
   } },
-  { blocks: [11], windows: true, pre: 'new', check: async (t, v) => {
+  { blocks: [13], windows: true, pre: 'new', check: async (t, v) => {
     t.eq('windows: running', v.sys.state.phase, 'running');
     t.check('windows: hw.env', !!v.hw.env.WAYLAND_DISPLAY, JSON.stringify(v.hw.env));
   } },
@@ -117,12 +130,12 @@ const showToast = (title) => { calls.showToast = title; };
 const openBrowserWindow = (url) => { calls.openBrowserWindow = url; };
 const closeTerminalWindow = () => { calls.closeTerminalWindow = true; };
 `;
-const NAMES = ['sys', 'fs', 'hw', 'sh', 'env', 'code', 'stdout', 'gl', 'off', 'term', 'button'];
+const NAMES = ['sys', 'fs', 'hw', 'sh', 'env', 'code', 'stdout', 'gl', 'off', 'term', 'button', 'srv', 'conn', 'reply'];
 
 export default async function (t) {
   const { eq, check, say } = t;
   if (t.phase === 1) {
-    eq('the README\'s examples', BLOCKS.length, 12);
+    eq('the README\'s examples', BLOCKS.length, 14);
     members(t);
   }
   const phase = PHASES[t.phase - 1];
@@ -131,7 +144,8 @@ export default async function (t) {
   const pre = phase.pre === undefined ? '' : `const { System } = M['@gexemu/runtime']; const { MemoryFilesystem } = M['@gexemu/runtime/fs'];
 const sys = new System({ baseUrl: BASE, debug: DEBUG }); const fs = new MemoryFilesystem(sys); fs.addTar(${JSON.stringify(tree)});
 ${phase.pre === 'booted' ? 'await sys.boot();' : ''}`;
-  const parts = [STUBS, pre, ...phase.blocks.map((i) => prepare(BLOCKS[i], tree))];
+  // What the blocks need running in the guest first (`prep`).
+  const parts = [STUBS, pre, phase.prep ? 'await PREP(sys, fs);' : '', ...phase.blocks.map((i) => prepare(BLOCKS[i], tree))];
   if (phase.boot) parts.push('await sys.boot();');
   for (const i of phase.after ?? []) parts.push(prepare(BLOCKS[i], tree));
   // `new System()` as the README has it, with the runner's base (where it
@@ -143,7 +157,7 @@ ${phase.pre === 'booted' ? 'await sys.boot();' : ''}`;
   const AsyncFunction = (async () => {}).constructor;
   let v;
   try {
-    v = await t.timeout(new AsyncFunction('M', 'BASE', 'DEBUG', 'calls', 'innerWidth', 'innerHeight', body)(M, t.baseUrl, t.debug(), {}, 1280, 720), 180000, `blocks ${phase.blocks}`);
+    v = await t.timeout(new AsyncFunction('M', 'BASE', 'DEBUG', 'calls', 'innerWidth', 'innerHeight', 'PREP', body)(M, t.baseUrl, t.debug(), {}, 1280, 720, (sys, fs) => phase.prep(t, sys, fs)), 180000, `blocks ${phase.blocks}`);
   } catch (e) {
     // What the single-thread build refuses, as the README says it does.
     if (SINGLE && phase.refusedSingle) check(`blocks ${phase.blocks.join(', ')}: the single-thread build refuses them`, phase.refusedSingle.test(e.message), e.message);
@@ -160,7 +174,7 @@ ${phase.pre === 'booted' ? 'await sys.boot();' : ''}`;
 /** Every class the README's tables name, with their members. */
 function members(t) {
   const want = {
-    'System': [index.System.prototype, ['boot', 'spawn', 'run', 'init', 'state', 'describe', 'sync', 'shutdown', 'hostCalls', 'net', 'network', 'addEventListener']],
+    'System': [index.System.prototype, ['boot', 'spawn', 'run', 'init', 'state', 'describe', 'sync', 'shutdown', 'hostCalls', 'net', 'network', 'listen', 'connect', 'addEventListener']],
     'Process': [index.Process.prototype, ['pid', 'kill', 'windows', 'addEventListener']],
     'Filesystem': [fsMod.Filesystem.prototype, ['open', 'read', 'write', 'size', 'truncate', 'flush', 'addTar', 'addFiles', 'readFile', 'writeFile', 'stat', 'readdir', 'mkdir', 'rm', 'rename', 'symlink', 'readlink', 'chmod', 'watch', 'mount', 'unmount', 'mounts']],
     'Mount': [fsMod.Mount.prototype, ['unmount']],

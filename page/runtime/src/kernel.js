@@ -7,7 +7,7 @@
 
 import { SP_CODE, MP_CODE } from '../../../hosts/browser/js/mode.mjs';
 
-const ERRNO = { 1: 'EPERM', 2: 'ENOENT', 9: 'EBADF', 11: 'EAGAIN', 13: 'EACCES', 17: 'EEXIST', 18: 'EXDEV', 20: 'ENOTDIR', 21: 'EISDIR', 22: 'EINVAL', 28: 'ENOSPC', 36: 'ENAMETOOLONG', 39: 'ENOTEMPTY', 40: 'ELOOP', 111: 'ECONNREFUSED' };
+const ERRNO = { 1: 'EPERM', 2: 'ENOENT', 9: 'EBADF', 11: 'EAGAIN', 13: 'EACCES', 17: 'EEXIST', 18: 'EXDEV', 20: 'ENOTDIR', 21: 'EISDIR', 22: 'EINVAL', 28: 'ENOSPC', 36: 'ENAMETOOLONG', 39: 'ENOTEMPTY', 40: 'ELOOP', 32: 'EPIPE', 91: 'EPROTOTYPE', 98: 'EADDRINUSE', 104: 'ECONNRESET', 107: 'ENOTCONN', 111: 'ECONNREFUSED' };
 
 /** A negated errno `n` as an Error that says `what`. */
 export function errno(n, what) {

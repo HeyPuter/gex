@@ -15,7 +15,7 @@ import { INTERNAL, bytesOf, envList, signalNumber } from './internal.js';
 import { Process } from './process.js';
 import { NetSwitch } from './netswitch.js';
 import { Sockets, dialFor } from '../../src/net.js';
-import { GuestConnection } from './connection.js';
+import { GuestConnection, UnixListener } from './connection.js';
 import { PageFsHost } from './mount.js';
 import { Kernel, errno } from './kernel.js';
 import { Files } from './kfs.js';
@@ -23,6 +23,26 @@ import { Programs } from './programs.js';
 import files from './runtime-files.js';
 import { SP_CODE, MP_CODE } from '../../../hosts/browser/js/mode.mjs';
 import { serveSlots, claimStore, storeBusy } from '../../../hosts/browser/js/blocks.mjs';
+
+/** A unix socket name as `what` (listen, connect) takes it: an absolute
+ *  path, made plain (`.`, `..` and repeated slashes resolved, as the
+ *  kernel names a program's), or an abstract name (a leading NUL). At most
+ *  107 bytes, what a program's `sockaddr_un` holds. */
+function unixPath(what, path) {
+  if (typeof path !== 'string' || !(path.startsWith('/') || path.startsWith('\0'))) throw new TypeError(`${what}: an absolute path, or an abstract name starting with \\0`);
+  let p = path;
+  if (path.startsWith('/')) {
+    const parts = [];
+    for (const c of path.split('/')) {
+      if (c === '..') parts.pop();
+      else if (c && c !== '.') parts.push(c);
+    }
+    p = `/${parts.join('/')}`;
+    if (p === '/') throw new TypeError(`${what}: ${path} is the root`);
+  }
+  if (new TextEncoder().encode(p).length > 107) throw new TypeError(`${what}: ${path} is longer than a socket name can be (107 bytes)`);
+  return p;
+}
 
 /** Whether this system is the single-thread build's (@gexemu/runtime-single:
  *  the kernel and every process in one Worker, kernel-single-worker.js): a
@@ -144,6 +164,12 @@ export class System extends EventTarget {
   /** And its kernel. */
   #singleKernel = null;
   #hostCalls = new Map();
+  /** The page's unix socket listeners (`listen`): `{ path, l, bind,
+   *  binding, closed }`, `l` the kernel's listener once bound. */
+  #unix = new Set();
+  /** Whether boot has bound the listeners made before it: one made after
+   *  is bound at once. */
+  #unixUp = false;
   #pageFs = null;
   /** The init (`boot(argv, opts)`), `[argv, opts]`, and its Process once
    *  it runs. */
@@ -634,6 +660,10 @@ export class System extends EventTarget {
       await this.#xcacheRestore(s, k);
     }
     for (const [path, id] of fsi?.mounts?.() ?? []) await this.#files.mount(path, id);
+    // The unix socket names the page listens on (`listen`), bound before
+    // pid 1, which may connect to them at once.
+    this.#unixUp = true;
+    await Promise.all([...this.#unix].map((u) => u.bind()));
     // The page answers host calls (`hostCalls`): every process gets a
     // /dev/gex-host.
     step(k.r('k_host_calls_serve'));
@@ -798,6 +828,11 @@ export class System extends EventTarget {
     this.#running('connectGuest');
     if (!['127.0.0.1', 'localhost', '0.0.0.0'].includes(host)) throw new Error(`connectGuest: only the guest's own 127.0.0.1, not ${host}`);
     if (!Number.isInteger(port) || port <= 0 || port > 65535) throw new TypeError(`connectGuest: no port ${port}`);
+    return this.#connection((h) => this.#programs.connectGuest(h, port));
+  }
+
+  /** A connection of the page's, its ends made by `open(h)`. */
+  async #connection(open) {
     const h = this.#nextHandle++;
     const pr = this.#programs;
     const c = new GuestConnection({
@@ -808,12 +843,65 @@ export class System extends EventTarget {
     });
     this.#procs.set(h, c);
     try {
-      await pr.connectGuest(h, port);
+      await open(h);
     } catch (e) {
       this.#procs.delete(h);
       throw e;
     }
     return c;
+  }
+
+  /** Listen on the unix socket name `path` (an absolute path, or an
+   *  abstract name with a leading NUL), as a program's AF_UNIX stream
+   *  socket would: a program's `connect` to it is a connection the page
+   *  takes from the listener (`for await (const conn of listener)`), each a
+   *  `{ readable, writable, close() }`. Made before boot, the name is bound
+   *  as the kernel comes up. The socket file appears at `path` while it
+   *  listens. */
+  listen(path) {
+    const p = unixPath('listen', path);
+    if (['stopped', 'failed'].includes(this.#state.phase)) throw new Error(`listen: the system is ${this.#state.phase}`);
+    let ok, fail;
+    const ready = new Promise((res, rej) => { ok = res; fail = rej; });
+    const u = { path: p, l: null, binding: null, closed: false };
+    u.bind = () => (u.binding ??= this.#programs.listenUnix(p).then((l) => { u.l = l; ok(); }, (e) => { this.#unix.delete(u); fail(e); }));
+    this.#unix.add(u);
+    const listener = new UnixListener(p, {
+      ready,
+      take: () => this.#takeUnix(u),
+      close: async () => {
+        u.closed = true;
+        this.#unix.delete(u);
+        await u.binding?.catch(() => {});
+        if (u.l && this.#state.phase !== 'stopped') await this.#programs.unlistenUnix(u.l, p).catch(() => {});
+        // One never bound (closed before boot) is not waited for.
+        ok();
+      },
+    });
+    if (this.#unixUp) u.bind();
+    return listener;
+  }
+
+  /** The next connection to listener `u`, null once it is closed. */
+  async #takeUnix(u) {
+    const pr = this.#programs;
+    const id = await pr.acceptUnix(u.l);
+    if (id === null) return null;
+    if (u.closed || this.#state.phase === 'stopped') {
+      await this.#kernel.r('k_sock_close', id).catch(() => {});
+      return null;
+    }
+    return this.#connection((h) => pr.adopt(h, id));
+  }
+
+  /** Connect to what a program listens on at the unix socket name `path`
+   *  (an AF_UNIX stream socket's bind and listen): `{ readable, writable,
+   *  close() }`. Rejects with ECONNREFUSED when nothing listens there, ENOENT
+   *  when there is no such file either, as a program's connect fails. */
+  async connect(path) {
+    const p = unixPath('connect', path);
+    this.#running('connect');
+    return this.#connection((h) => this.#programs.connectUnix(h, p));
   }
 
   #running(what) {
@@ -1102,6 +1190,13 @@ export class System extends EventTarget {
     // What was written goes to the store before the store goes.
     if ((this.#state.phase === 'running' || this.#restFailed) && this.#stored) await this.sync().catch((e) => console.error(`[gex] shutdown: the filesystem's store could not take what was written: ${e.code ?? e.message}`));
     this.#state.phase = 'stopped';
+    // Listeners take nothing more.
+    for (const u of this.#unix) {
+      u.closed = true;
+      if (u.l) u.l.closed = true;
+    }
+    this.#unix.clear();
+    this.#programs?.kick();
     for (const p of this.#procs.values()) p[INTERNAL].exit({ code: 137, signal: 9, shutdown: true });
     this.#procs.clear();
     this.#byPid.clear();

@@ -96,8 +96,20 @@ export interface HostCalls {
 
 export interface GuestConnection extends EventTarget {
   readable: ReadableStream<Uint8Array>;
-  writable: WritableStream<Uint8Array>;
+  writable: WritableStream<Uint8Array | string>;
   close(): void;
+}
+
+/** `sys.listen`'s: the connections programs make to a unix socket name the page listens on. */
+export interface UnixListener extends AsyncIterable<GuestConnection> {
+  readonly path: string;
+  readonly closed: boolean;
+  /** Resolves once the name is bound (at boot for one made before it); rejects with its errno's code (EADDRINUSE, ENOENT, ...). */
+  readonly ready: Promise<void>;
+  /** The next connection; null once closed. */
+  accept(): Promise<GuestConnection | null>;
+  /** Stop listening: a program's connect is then refused (the socket file stays). Leaving a `for await` loop over it closes it too. */
+  close(): Promise<void>;
 }
 
 export declare class System extends EventTarget {
@@ -116,6 +128,10 @@ export declare class System extends EventTarget {
   get network(): Network | null;
   set network(network: Network | null);
   get net(): { connectGuest(port: number, options?: { host?: string }): Promise<GuestConnection> };
+  /** Listen on a unix socket name (an absolute path, or an abstract name with a leading NUL): each program's AF_UNIX stream connect to it is a GuestConnection. Before or after boot. */
+  listen(path: string): UnixListener;
+  /** Connect to a program listening on a unix socket name; rejects with code ECONNREFUSED or ENOENT as a program's connect would fail. */
+  connect(path: string): Promise<GuestConnection>;
   describe(): { phase: Phase; arch: string | null; processes: { pid: number | null; argv: string[] }[]; pids: number[]; threads: number; memory: { kernel: number } };
   /** What the programs wrote made durable in the filesystem's store (sync(2)). */
   sync(): Promise<void>;

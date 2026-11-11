@@ -27,6 +27,8 @@ const HOST = 0;
 const READ_MAX = 1 << 18;
 const IN = { MODIFY: 0x2, ATTRIB: 0x4, CLOSE_WRITE: 0x8, MOVED_FROM: 0x40, MOVED_TO: 0x80, CREATE: 0x100, DELETE: 0x200, DELETE_SELF: 0x400, MOVE_SELF: 0x800, IGNORED: 0x8000 };
 const WATCH_MASK = IN.ATTRIB | IN.CLOSE_WRITE | IN.MOVED_FROM | IN.MOVED_TO | IN.CREATE | IN.DELETE | IN.DELETE_SELF | IN.MOVE_SELF;
+/** The time the kernel stamps a change with: seconds. */
+const nowSecs = () => BigInt(Math.trunc(Date.now() / 1000));
 const winsize = (cols, rows) => (BigInt(rows & 0xffff) << 48n) | (BigInt(cols & 0xffff) << 32n);
 
 export class Programs {
@@ -153,6 +155,98 @@ export class Programs {
     await made;
   }
 
+  // -- unix sockets (`sys.listen`, `sys.connect`) ----------------------------
+  // The page's ends are the global kernel's own sockets, the ones a guest's
+  // AF_UNIX stream sockets are (hosts/kernel `k_sock_*`): a guest connecting
+  // to a name the page bound is queued on the page's listener as on any
+  // program's, and the page's connection is read and written as
+  // `connectGuest`'s is.
+
+  /** The page listening on unix socket name `path` (absolute, or abstract:
+   *  a leading NUL): `{ id, queue, ino }`, the listener, its wait queue and
+   *  the socket file's inode (0 for an abstract name). A socket file there
+   *  that nothing listens on is replaced, as a server unlinks a stale one;
+   *  any other file there is EADDRINUSE. */
+  async listenUnix(path) {
+    const k = this.#k;
+    const named = !path.startsWith('\0');
+    if (named) {
+      const parent = path.slice(0, path.lastIndexOf('/')) || '/';
+      const dir = await this.#files.stat(parent).catch((e) => e);
+      if (dir instanceof Error) throw dir.errno ? errno(-dir.errno, path) : dir;
+      if (dir.type !== 'directory') throw errno(-20, path);
+      const at = await this.#files.stat(path, false).catch(() => null);
+      if (at) {
+        if (at.type !== 'socket' || await k.r('k_sock_exists', { in: path })) throw errno(-98, path);
+        await k.r('k_fs_unlink_now', { in: path }, nowSecs());
+      }
+    }
+    const id = await k.r('k_sock_bind', { in: path }, 0, 0, 0);
+    if (id < 0) throw errno(id, path);
+    let ino = 0;
+    if (named) {
+      // The file is how a guest sees the name (`ls -l` shows an s); a
+      // filesystem that will not take one leaves the name reachable all the
+      // same, as a guest's bind does.
+      await k.r('k_fs_mksocket_now', { in: path }, nowSecs());
+      ino = (await this.#files.stat(path, false).catch(() => null))?.ino ?? 0;
+    }
+    const queue = await k.r('k_sock_queue', id);
+    await k.watch(queue);
+    return { id, queue, ino };
+  }
+
+  /** The next connection to listener `l` (`listenUnix`'s), as a socket id
+   *  for `adopt`, when one comes; null once `l.closed`. */
+  async acceptUnix(l) {
+    for (const k = this.#k; ;) {
+      const seq = k.seq();
+      if (l.closed) return null;
+      const r = await k.r('k_sock_accept', l.id).catch(() => -9);
+      if (r >= 0) return r;
+      if (r !== EAGAIN) throw errno(r, 'accept');
+      await k.changed(seq);
+    }
+  }
+
+  /** Listener `l` closed: its name gone (when the file there is still its
+   *  own, not one a guest made since unlinking it), what waited for accept
+   *  refused. The file stays, as on Linux: a guest's connect is refused. */
+  async unlistenUnix(l, path) {
+    const k = this.#k;
+    l.closed = true;
+    k.kick();
+    await k.unwatch(l.queue);
+    if (!path.startsWith('\0')) {
+      const at = await this.#files.stat(path, false).catch(() => null);
+      if (at?.type === 'socket' && at.ino === l.ino) await k.r('k_sock_rename', { in: path }, { in: '' });
+    }
+    await k.r('k_sock_close', l.id);
+  }
+
+  /** A socket id the page now holds (`acceptUnix`'s) as handle `h`'s ends. */
+  async adopt(h, id) {
+    const made = (async () => {
+      const q = await this.#k.r('k_sock_queue', id);
+      await this.#k.watch(q);
+      return { h, pid: 0, pty: -1, stdin: -1, stdout: -1, stderr: -1, sock: id, queues: [q] };
+    })();
+    this.#ends.set(h, made.catch(() => null));
+    await made;
+  }
+
+  /** A connection of the page's to what a program listens on at unix socket
+   *  name `path`: ECONNREFUSED when nothing does, ENOENT when there is no
+   *  file there either, as on Linux. */
+  async connectUnix(h, path) {
+    const id = await this.#k.r('k_sock_connect', { in: path }, 0, 0, 0, 0, 0);
+    if (id < 0) {
+      const missing = id === -111 && !path.startsWith('\0') && !(await this.#files.stat(path).catch(() => null));
+      throw errno(missing ? -2 : id, path);
+    }
+    await this.adopt(h, id);
+  }
+
   /** The next bytes the program wrote to `fd` (1 or 2; a connection has one
    *  way in), when it writes them; null at their end; undefined when it
    *  holds nothing and `done()` says to stop waiting. */
@@ -162,6 +256,8 @@ export class Programs {
     if (id < 0) return null;
     const f = e.sock >= 0 ? 'k_sock_read' : 'k_pipe_read';
     for (const k = this.#k; ;) {
+      // A connection let go meanwhile: its id may be another's by now.
+      if (e.sock >= 0 ? e.sock !== id : f === 'k_sock_read') return null;
       const seq = k.seq();
       // Whether it had ended before this read: only then is an empty pipe
       // all it wrote. One that ends while the read is under way may have
@@ -175,8 +271,10 @@ export class Programs {
         if (!done?.()) await k.changed(seq);
         continue;
       }
-      // The program closed it (0), or it failed.
+      // The program closed it (0), or it failed: a connection's failure is
+      // the reader's error.
       if (e.sock < 0) await this.#close(e, fd === 2 ? 'stderr' : 'stdout');
+      else if (r < 0 && r !== -9) throw errno(r, 'read');
       return null;
     }
   }
@@ -193,7 +291,8 @@ export class Programs {
   }
 
   /** `bytes` to the program, as it takes them; dropped when nobody reads
-   *  them any more. */
+   *  them any more, when a connection's write says why (a negated errno:
+   *  EPIPE once the far end has closed). */
   async write(h, bytes) {
     const e = await this.#ends.get(h);
     if (!e) return;
@@ -205,12 +304,15 @@ export class Programs {
     const id = e.sock >= 0 ? e.sock : e.stdin;
     const f = e.sock >= 0 ? 'k_sock_write' : 'k_pipe_write';
     for (let b = bytes; b.length && id >= 0;) {
+      // A connection let go meanwhile: its id may be another's by now.
+      if (e.sock >= 0 ? e.sock !== id : e.stdin !== id) return -9;
       const seq = k.seq();
       const r = await k.r(f, id, { in: b.subarray(0, READ_MAX) }).catch(() => -9);
       if (r === EAGAIN || r === 0) await k.changed(seq);
-      else if (r < 0) return;
+      else if (r < 0) return r;
       else b = b.subarray(r);
     }
+    return 0;
   }
 
   /** The end of what the page writes: the program reads end of file. */
@@ -268,9 +370,12 @@ export class Programs {
     this.#ends.delete(h);
     if (!e) return;
     if (e.sock >= 0) {
-      await this.#k.unwatch(e.queues[0]);
-      await this.#k.r('k_sock_close', e.sock);
+      const id = e.sock;
       e.sock = -1;
+      await this.#k.unwatch(e.queues[0]);
+      await this.#k.r('k_sock_close', id);
+      // A read or write still waiting on it stops.
+      this.#k.kick();
     }
     if (e.pty >= 0) {
       if (e.reading) await this.#k.unwatch(e.queues[0]);

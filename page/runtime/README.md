@@ -500,6 +500,56 @@ and a `close` event; closing the writable is a half close, which the
 program reads as the end. It rejects with `ECONNREFUSED` when nothing
 listens.
 
+## Unix sockets
+
+The page can be either end of a program's AF_UNIX stream socket.
+`sys.listen(path)` listens on a name, as a program's `bind` and `listen`
+would: each program's `connect` to it is a connection the page takes.
+`sys.connect(path)` connects to a name a program listens on. Each
+connection is the `{ readable, writable, close() }` that `connectGuest`
+gives.
+
+```js
+const srv = sys.listen('/run/app.sock');       // before or after boot
+(async () => {
+  for await (const conn of srv) conn.readable.pipeTo(conn.writable); // an echo server
+})();
+// guest: perl -MIO::Socket::UNIX -e '$s = IO::Socket::UNIX->new(Peer => "/run/app.sock") or die $!; print $s "hello\n"; print scalar <$s>'
+//        -> "hello"
+```
+
+```js
+// guest, a server that upper-cases what it reads:
+//   perl -MIO::Socket::UNIX -e '$l = IO::Socket::UNIX->new(Local => "/run/myd.sock", Listen => 1) or die $!; $c = $l->accept; print $c uc while <$c>'
+const conn = await sys.connect('/run/myd.sock');
+const w = conn.writable.getWriter();
+await w.write('hello\n');
+await w.close();                                 // the program reads the end
+const reply = await new Response(conn.readable).text(); // "HELLO\n", then the program closes
+```
+
+| Member | Does |
+| --- | --- |
+| `sys.listen(path)` | A listener on `path`: an absolute path, or an abstract name with a leading `\0`. The socket file appears at `path` (`ls -l` shows `s`) once it is bound: at once when the system runs, else as it boots, before the init or any program starts. A socket file there that nothing listens on is replaced; any other file there, or a name something listens on, is `EADDRINUSE`, and a missing directory `ENOENT`. |
+| `listener.ready` | Resolves once the name is bound; rejects (the error's `code`) when it could not be. |
+| `listener.accept()` | The next connection, when a program makes one; `null` once closed. A connection the page has not taken waits in the kernel, as on Linux: the program's `connect` has returned. |
+| `for await (const conn of listener)` | Each connection as it comes. Leaving the loop closes the listener. |
+| `listener.close()` | Stops listening: the name is let go, and a program's `connect` is then refused (`ECONNREFUSED`; the socket file stays, as on Linux, until something unlinks it). Connections not taken yet are closed; ones taken stay open. |
+| `sys.connect(path)` | A connection to what a program listens on at `path`. Rejects with `ECONNREFUSED` when nothing listens there and `ENOENT` when there is no file there either, as a program's `connect` fails. The system must be running. |
+| `conn.readable` | What the program sends. Read only as the page reads it: a page that stops reading leaves the program's writes blocked once the socket's buffer is full (256 KiB), as a slow reader on Linux does. It ends when the program closes its socket or shuts down its writing (`shutdown(SHUT_WR)`), or exits. |
+| `conn.writable` | To the program. Each write resolves when the program's socket has taken it, so the page's writes wait on a program that does not read. `close()` is a half close (the program's `read` returns 0; it can still write back); `abort()` closes both ways. A write after the program has closed rejects with `EPIPE`. |
+| `conn.close()` | Both ways at once: the program reads the end, and its writes fail with `EPIPE`. |
+
+The page's ends are the kernel's own sockets, the ones programs' sockets
+are, so a program waits on them with `poll`, `select` or `epoll` as on any
+other (async runtimes, libuv, Python's asyncio), and many connections may be
+open at once. The connecting side's credentials (`SO_PEERCRED`) for a page
+end are pid 0, uid 0, gid 0. Not in it: datagram sockets (a program's
+`SOCK_DGRAM` connect or send to a name the page listens on fails), and
+`SOCK_SEQPACKET` keeps no message boundaries (a program's seqpacket
+connect works, as a stream); a program's death is the end of the page's
+`readable`, not an error, as for a Linux unix socket.
+
 ## Host calls
 
 The page's functions a guest program calls. A program opens
