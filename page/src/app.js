@@ -197,6 +197,7 @@ function progressMeter(state, onProgress) {
     log: [],
   };
   state.progress = p;
+  const onReady = [];
   const log = (kind, text) => {
     p.log.push({ t: Math.round(performance.now() - t0), kind, text });
     if (p.log.length > 50) p.log.splice(0, p.log.length - 50);
@@ -360,7 +361,10 @@ function progressMeter(state, onProgress) {
       if (name === 'boot') log('phase', p.compile.total ? `Compiled ${p.compile.done} units; starting the program` : 'Starting the program');
       if (name === 'first-frame') log('phase', `First window after ${secs(p.at[name])}`);
       emit();
+      if (name === 'ready') for (const f of onReady.splice(0)) f();
     },
+    /** `f` once the start-up is over. */
+    whenReady(f) { if (p.phase === 'ready') f(); else onReady.push(f); },
     /** The run is over: 'exited' or 'failed'. */
     end(name, error = null) {
       if (p.phase === 'failed' || p.phase === 'exited') return;
@@ -818,6 +822,7 @@ async function begin(opts, base, at, state, meter, lets) {
       const ready = await new Promise((r) => {
         w.onmessage = ({ data: m }) => {
           if (m.kind === 'ready') r(m);
+          else if (m.kind === 'ahead') say(`[app] rest bundle fetched ahead: ${m.frames} frames, ${(m.bytes / 1e6).toFixed(1)} MB\n`);
           else if (m.kind === 'bytes') {
             lc.net += m.net;
             lc.cached += m.cached;
@@ -832,6 +837,16 @@ async function begin(opts, base, at, state, meter, lets) {
       if (ready.ok) {
         lc.on = true;
         lazyCache = { ctl };
+        // The rest bundles' frames fetched in the background once the start-up is over (none while the page is
+        // hidden): the reads after it find them in the owner's store.
+        const restBundles = [...new Set(lazy.map(([, , url]) => String(url)).filter((u) => u.includes('#')).map((u) => u.slice(0, u.lastIndexOf('#'))))];
+        if (restBundles.length && sw.restahead !== '0') {
+          const paused = () => w.postMessage({ kind: 'ahead', paused: document.visibilityState === 'hidden' });
+          meter.whenReady(() => {
+            w.postMessage({ kind: 'ahead', bundles: restBundles, paused: document.visibilityState === 'hidden' });
+            document.addEventListener('visibilitychange', paused);
+          });
+        }
       } else {
         w.terminate();
         lc.why = ready.why;

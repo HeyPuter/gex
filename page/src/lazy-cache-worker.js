@@ -85,10 +85,10 @@ class Whole {
 }
 /** Bytes [lo, hi) of `url` from the network (or its kept whole answer):
  *  null if the host gave nothing usable. */
-async function fetchRange(url, lo, hi) {
+async function fetchRange(url, lo, hi, priority) {
   let w = wholes.get(url);
   if (!w) {
-    const res = await fetch(url, { headers: { Range: `bytes=${lo}-${hi - 1}` }, cache: 'no-store' });
+    const res = await fetch(url, { headers: { Range: `bytes=${lo}-${hi - 1}` }, cache: 'no-store', ...(priority ? { priority } : {}) });
     if (res.status === 206) {
       const b = new Uint8Array(await res.arrayBuffer());
       net += b.length;
@@ -208,12 +208,12 @@ async function decoder() {
 // said so once).
 const failed = new FailedFrames();
 const heldError = new Error('given up a moment ago');
-async function getRange(url, lo, hi) {
+async function getRange(url, lo, hi, priority) {
   const body = await retryAsync(async () => {
     // Never the HTTP cache's copy: a range of an older bundle under the same
     // URL would decode as garbage. A bundle with a hash keeps its frames in
     // the page's own cache (`frameOf`) instead.
-    const b = await fetchRange(url, lo, hi);
+    const b = await fetchRange(url, lo, hi, priority);
     return b && b.length === hi - lo ? b : null;
   });
   if (!body) throw new Error(`${url} @${lo}: no answer`);
@@ -237,6 +237,10 @@ const frameKey = (url, b, k) => {
   return u.href;
 };
 const kept_ = (n) => { kept += n; };
+async function storedHas(url, b, k) {
+  if (!store_ || !b.h) return false;
+  try { return !!(await store_.match(frameKey(url, b, k))); } catch { return false; }
+}
 async function stored(url, b, k) {
   if (!store_ || !b.h) return null;
   try {
@@ -272,6 +276,74 @@ function storeWhole(url, b) {
   });
 }
 
+// A frame's compressed bytes from the network, one request however many want it (`URL#k` -> promise while in
+// flight): a read's (`ahead` false), kept packed and stored, or the background's (`ahead`), stored only when the
+// page's cache holds the bundle's frames (packed otherwise).
+const fetching = new Map();
+let demand = 0;
+function fetchFrame(url, b, k, ahead) {
+  const key = `${url}#${k}`;
+  let p = fetching.get(key);
+  if (p) return p;
+  const [o, n] = b.frames[k];
+  if (!ahead) demand++;
+  p = getRange(url, o, o + n, ahead ? 'low' : undefined).then((got) => {
+    if (!ahead || !store_ || !b.h) keepPacked(key, got);
+    store(url, b, k, got);
+    storeWhole(url, b);
+    return got;
+  }).finally(() => {
+    fetching.delete(key);
+    if (!ahead) demand--;
+    wakeAhead();
+  });
+  fetching.set(key, p);
+  return p;
+}
+
+// The rest bundles fetched in the background once the program has started (the page's `{kind: 'ahead'}`):
+// every frame not held yet, one at a time, at low priority, into the same store a read looks in, so the reads
+// after find their frames here. A read's own fetch goes first: none starts while one is in flight. Paused while
+// the page is hidden (`{kind: 'ahead', paused}`), and none on a save-data or 2G connection.
+let aheadPaused = false, aheadRunning = false, aheadWaiter = null;
+function wakeAhead() {
+  const w = aheadWaiter;
+  aheadWaiter = null;
+  w?.();
+}
+const thrifty = () => {
+  const c = globalThis.navigator?.connection;
+  return !!(c && (c.saveData || /(^|-)2g$/.test(c.effectiveType ?? '')));
+};
+const aheadState = { frames: 0, bytes: 0, done: false };
+async function ahead(urls) {
+  if (aheadRunning) return;
+  aheadRunning = true;
+  try {
+    for (const url of urls) {
+      let b;
+      try { b = await bundleIndex(url); } catch { continue; }
+      for (let k = 0; k < b.frames.length; k++) {
+        const key = `${url}#${k}`;
+        while (aheadPaused || demand > 0) await new Promise((r) => { aheadWaiter = r; });
+        if (thrifty()) return;
+        if (packed.has(key) || fetching.has(key) || failed.held(key)) continue;
+        if (!store_ || !b.h) { if (packedBytes + b.frames[k][1] > PACKED_BUDGET) break; }
+        else if (await storedHas(url, b, k)) continue;
+        try {
+          await fetchFrame(url, b, k, true);
+          aheadState.frames++;
+          aheadState.bytes += b.frames[k][1];
+        } catch { /* a read of it tries again */ }
+      }
+    }
+    aheadState.done = true;
+    self.postMessage({ kind: 'ahead', ...aheadState });
+  } finally {
+    aheadRunning = false;
+  }
+}
+
 // One fetch a frame however many readers want it: they share its promise
 // (`decoded`) while it is in flight.
 function frameOf(url, b, k) {
@@ -281,7 +353,6 @@ function frameOf(url, b, k) {
     decoded.delete(key);
   } else {
     if (failed.held(key)) return Promise.reject(heldError);
-    const [o, n] = b.frames[k];
     const kept = packedFrame(key);
     const z = kept ? Promise.resolve(kept) : stored(url, b, k).then((have) => {
       if (have) {
@@ -289,12 +360,7 @@ function frameOf(url, b, k) {
         keepPacked(key, have);
         return have;
       }
-      return getRange(url, o, o + n).then((got) => {
-        keepPacked(key, got);
-        store(url, b, k, got);
-        storeWhole(url, b);
-        return got;
-      });
+      return fetchFrame(url, b, k, false);
     });
     f = Promise.all([z, decoder()]).then(([zb, d]) => d.decode(zb, k === b.frames.length - 1 ? 0 : b.frame));
     f.catch(() => { decoded.delete(key); failed.failed(key); });
@@ -303,14 +369,12 @@ function frameOf(url, b, k) {
   while (decoded.size > FRAMES_KEPT) decoded.delete(decoded.keys().next().value);
   return f;
 }
-/** `len` bytes at `from` of the file at `href` (`BUNDLE#OFFSET`). */
-async function bundleRead(href, from, len) {
-  const cut = href.lastIndexOf('#');
-  const url = href.slice(0, cut), start = Number(href.slice(cut + 1)) + from;
+/** A rest bundle's index (BUNDLE.json), fetched once. */
+function bundleIndex(url) {
   let b = bundles.get(url);
   if (!b) {
     const key = `${url}.json`;
-    if (failed.held(key)) throw heldError;
+    if (failed.held(key)) return Promise.reject(heldError);
     b = retryAsync(async () => {
       // The index of this deploy's bundle, never an older cached one.
       const r = await fetch(key, { cache: 'no-cache' });
@@ -320,7 +384,13 @@ async function bundleRead(href, from, len) {
     bundles.set(url, b);
     b.catch(() => { bundles.delete(url); failed.failed(key); });
   }
-  b = await b;
+  return b;
+}
+/** `len` bytes at `from` of the file at `href` (`BUNDLE#OFFSET`). */
+async function bundleRead(href, from, len) {
+  const cut = href.lastIndexOf('#');
+  const url = href.slice(0, cut), start = Number(href.slice(cut + 1)) + from;
+  const b = await bundleIndex(url);
   const first = Math.floor(start / b.frame), last = Math.floor((start + len - 1) / b.frame);
   const out = new Uint8Array(len);
   for (let k = first, at = start; k <= last; k++) {
@@ -333,7 +403,14 @@ async function bundleRead(href, from, len) {
   return out;
 }
 
-self.onmessage = async ({ data: m }) => {
+// The first message sets the owner up (`start`); then the page's `{kind: 'ahead', bundles?, paused?}`.
+self.onmessage = ({ data: m }) => {
+  if (m?.kind !== 'ahead') return start(m);
+  if ('paused' in m) aheadPaused = !!m.paused;
+  wakeAhead();
+  if (m.bundles?.length) ahead(m.bundles);
+};
+async function start(m) {
   const ctl = new Int32Array(m.ctl);
   const raw = new Uint8Array(m.ctl);
   const memory = m.memory;
@@ -401,4 +478,4 @@ self.onmessage = async ({ data: m }) => {
     const w = Atomics.waitAsync(ctl, 0, seen);
     if (w.async) await w.value;
   }
-};
+}
