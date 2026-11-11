@@ -334,7 +334,7 @@ pub struct Placement {
     pub placed: bool,
     /// The client draws the whole window: no decoration.
     pub unmanaged: bool,
-    /// 0 normal, 1 topmost, 2 overlay (menus).
+    /// 0 normal, 1 topmost, 2 overlay (menus), 3 desktop (below the rest).
     pub layer: u32,
     /// The client's name for the surface, which other placed surfaces --
     /// of any client in the session -- use to say what they go below.
@@ -351,6 +351,15 @@ pub struct Placement {
 impl Placement {
     /// The bottom of a layer, for `below`.
     pub const BOTTOM: u32 = u32::MAX;
+    /// The desktop layer: below every other window, placed or not (a window
+    /// system's own desktop window, which draws the background and its icons).
+    pub const DESKTOP: u32 = 3;
+
+    /// Where the layer goes in the stacking, low to high: the desktop under
+    /// normal, topmost and overlay.
+    pub fn rank(&self) -> i32 {
+        if self.layer == Self::DESKTOP { -1 } else { self.layer as i32 }
+    }
 
     /// The placement words of a surface record (`R_PLACE`.. in
     /// `wl-bridge.mjs`): flags and layer, id, below, restack, activate.
@@ -576,8 +585,9 @@ const GLOBALS: &[(&str, u32)] = &[
     // and what it is under, and the compositor shows it there rather than
     // cascading it. See `protocols/gex-window-placement-v1.xml`. Version 2
     // adds the `origin` event: where the compositor has the surface, for
-    // turning its surface-local pointer positions into Win32's.
-    ("gex_window_placement_manager_v1", 2),
+    // turning its surface-local pointer positions into Win32's; version 3
+    // the desktop layer, under every other window.
+    ("gex_window_placement_manager_v1", 3),
     // Mouse look: a lock the host grants (the page's pointer lock) and the
     // movement under it (pointer.rs). Xwayland locks for an X client that
     // grabs the pointer and hides it.
@@ -1362,7 +1372,7 @@ impl Client {
             }
             "gex_window_placement_manager_v1" => {
                 self.objects.insert(id, Object::PlacementManager);
-                self.placement_version = version.min(2);
+                self.placement_version = version.min(3);
             }
             "zwp_relative_pointer_manager_v1" => {
                 self.objects.insert(id, Object::RelativePointerManager);
@@ -2651,9 +2661,12 @@ impl Client {
                 }),
                 _ => ok = false,
             },
-            // set_layer(layer)
+            // set_layer(layer): desktop is for version 3 and up.
             2 => match r.uint() {
-                Some(layer) => apply(self, &mut |s| s.placement.layer = layer.min(2)),
+                Some(layer) => {
+                    let layer = if layer == Placement::DESKTOP && self.placement_version >= 3 { layer } else { layer.min(2) };
+                    apply(self, &mut |s| s.placement.layer = layer)
+                }
                 None => ok = false,
             },
             // set_stack_id(id)
@@ -4161,6 +4174,27 @@ mod tests {
         c.receive(&Writer::new(6, 6).finish(), &[], &pool);
         let s = c.scene().into_iter().find(|s| s.surface == 6).expect("the window");
         assert_eq!((s.width, s.height, s.addr), (200, 125, 0x10_0000));
+    }
+
+    /// The desktop layer is for clients that bound version 3: an older one's
+    /// unknown layer is the overlay, as it always was.
+    #[test]
+    fn the_desktop_layer_needs_version_3() {
+        let pool = Placed(0x6000, 8192);
+        for (version, want) in [(3, Placement::DESKTOP), (2, 2)] {
+            let (mut c, _) = placed_window(64, 32, 256);
+            c.receive(
+                &Writer::new(2, 0).uint(10).string("gex_window_placement_manager_v1").uint(version).new_id(59).finish(),
+                &[],
+                &pool,
+            );
+            c.receive(&Writer::new(59, 1).new_id(60).object(6).finish(), &[], &pool);
+            c.receive(&Writer::new(60, 2).uint(Placement::DESKTOP).finish(), &[], &pool);
+            c.receive(&Writer::new(6, 6).finish(), &[], &pool);
+            assert!(c.failed.is_none(), "{:?}", c.failed);
+            let p = c.scene()[0].placement;
+            assert_eq!((p.layer, p.rank() < 0), (want, version == 3), "version {version}");
+        }
     }
 
     #[test]

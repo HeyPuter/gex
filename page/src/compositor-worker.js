@@ -1001,9 +1001,10 @@ class Compositor {
 
   /** The windows bottom to top: the stacking order, a layer at a time. */
   #stack() {
+    // The desktop layer (3) is under every other window, placed or not.
     const layer = (k) => {
       const w = this.#windows.get(k);
-      return w?.placed ? w.layer : 0;
+      return !w?.placed ? 0 : w.layer === 3 ? -1 : w.layer;
     };
     // `sort` is stable: within a layer, the stacking order stands.
     return [...this.#order].sort((a, b) => layer(a) - layer(b));
@@ -1861,7 +1862,7 @@ class Compositor {
     if (!this.#focus && pressed) {
       const shown = (w) => w?.role === ROLE_TOPLEVEL && (w.info?.serial ?? 0) > 0 && w.width > 0 && w.height > 0
         && w.x < this.#outW && w.y < this.#outH && w.x + w.width > 0 && w.y + w.height > 0;
-      const top = [...this.#order].reverse().find((o) => shown(this.#windows.get(o)));
+      const top = this.#stack().reverse().find((o) => shown(this.#windows.get(o)));
       if (top) {
         this.#note(`no window has the keyboard; it goes to the top one, ${top}`);
         this.#focusWindow(top);

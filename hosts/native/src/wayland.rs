@@ -782,7 +782,7 @@ impl Screen {
     /// The placed surfaces bottom to top, layers kept apart.
     fn stack(&self) -> Vec<Key> {
         let mut v = self.order.clone();
-        v.sort_by_key(|k| self.placed.get(k).map(|p| p.2.layer).unwrap_or(0));
+        v.sort_by_key(|k| self.placed.get(k).map(|p| p.2.rank()).unwrap_or(0));
         v
     }
 
@@ -946,17 +946,27 @@ impl Screen {
         }
     }
 
-    /// What to draw, bottom to top: windows nobody placed centred, as
-    /// before, then the placed ones where they are.
+    /// What to draw, bottom to top: the desktop layer's placed windows, then
+    /// windows nobody placed centred, as before, then the other placed ones
+    /// where they are.
     fn items(&self) -> Vec<(u64, &Frame, Option<(i32, i32)>)> {
         let key = |k: &Key| (k.0 << 32) | u64::from(k.1);
+        let stack = self.stack();
+        let desktop = |k: &Key| self.placed.get(k).is_some_and(|p| p.2.rank() < 0);
+        let mut out = Vec::new();
+        let mut placed = |out: &mut Vec<_>, k: &Key| {
+            if let (Some(f), Some(&(x, y, _))) = (self.frames.get(k), self.placed.get(k)) {
+                out.push((key(k), f, Some((x, y))));
+            }
+        };
+        for k in stack.iter().filter(|k| desktop(k)) {
+            placed(&mut out, k);
+        }
         let mut loose: Vec<_> = self.frames.iter().filter(|(k, _)| !self.placed.contains_key(k)).collect();
         loose.sort_by_key(|(k, _)| **k);
-        let mut out: Vec<_> = loose.into_iter().map(|(k, f)| (key(k), f, None)).collect();
-        for k in self.stack() {
-            if let (Some(f), Some(&(x, y, _))) = (self.frames.get(&k), self.placed.get(&k)) {
-                out.push((key(&k), f, Some((x, y))));
-            }
+        out.extend(loose.into_iter().map(|(k, f)| (key(k), f, None)));
+        for k in stack.iter().filter(|k| !desktop(k)) {
+            placed(&mut out, k);
         }
         out
     }
@@ -1117,6 +1127,24 @@ mod tests {
         let out = s.route(&[(Ev::Key(28, true), 10)]);
         assert_eq!(out.len(), 1);
         assert!(matches!(out[0], (1, Routed::Key(28, true, 10))));
+    }
+
+    /// A desktop-layer window stays under a normal window sent to the bottom
+    /// of its layer, is drawn first, and takes the pointer over the bare
+    /// desktop.
+    #[test]
+    fn the_desktop_layer_is_under_the_rest() {
+        let mut s = Screen::default();
+        window(&mut s, (1, 5), 0);
+        s.placed.get_mut(&(1, 5)).unwrap().2.layer = Placement::DESKTOP;
+        window(&mut s, (2, 7), 50);
+        s.restack((2, 7), Placement::BOTTOM);
+        assert_eq!(s.order, vec![(2, 7), (1, 5)], "the bottom of the order");
+        assert_eq!(s.stack(), vec![(1, 5), (2, 7)], "the desktop still under");
+        let drawn: Vec<u64> = s.items().iter().map(|i| i.0).collect();
+        assert_eq!(drawn, vec![(1 << 32) | 5, (2 << 32) | 7]);
+        assert_eq!(s.hit(10, 10), Some(((1, 5), 10, 10)), "over the bare desktop");
+        assert_eq!(s.hit(60, 10), Some(((2, 7), 10, 10)), "over the window");
     }
 
     /// With no window on the screen, a key goes nowhere.

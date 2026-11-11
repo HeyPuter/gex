@@ -110,7 +110,7 @@ class DomWindow {
     this.decorations = s.role === ROLE_TOPLEVEL && !(s.placed && s.unmanaged) ? 'server' : 'none';
     /** Placed by its client (`gex_window_placement_v1`: a Win32 window, an X
      * menu): `relX`/`relY` are where it goes in the desktop's pixels, and
-     * `layer` (0 normal, 1 topmost, 2 menus) and `onrestack` how it stacks.
+     * `layer` (0 normal, 1 topmost, 2 menus, 3 desktop) and `onrestack` how it stacks.
      * The page does not move it. */
     this.placed = !!s.placed;
     this.layer = s.layer || 0;

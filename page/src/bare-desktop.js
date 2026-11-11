@@ -21,7 +21,7 @@ import { ROLE_TOPLEVEL, ROLE_POPUP, ROLE_SUBSURFACE, ROLE_CURSOR } from './dom-c
 /** Lay `desktop`'s windows out in `mount` (a positioned element). */
 export function bareDesktop(desktop, mount) {
   const placed = new Map(); // key -> { x, y }
-  let z = 1;
+  let z = 1000;
   let cascade = 0;
   const keyOfParent = (win) => `${win.token}:${win.client}:${win.parent}`;
   // A window its client places (`gex_window_placement_v1`: every Win32
@@ -54,8 +54,9 @@ export function bareDesktop(desktop, mount) {
     win.canvas.style.height = `${win.canvas.height}px`;
   };
   // Placed windows' stacking, bottom to top, per layer (0 normal, 1 topmost,
-  // 2 menus); every layer above every unplaced window.
-  const stacks = [[], [], []];
+  // 2 menus, 3 desktop); every layer above every unplaced window but the
+  // desktop's, which is under them all (unplaced toplevels start at z 1000).
+  const stacks = [[], [], [], []];
   // A subsurface is part of its parent (Wine's GL client area is one, over
   // its toplevel): it takes the parent's z and is above it by being later in
   // the document, so it goes wherever the parent is stacked. Over every
@@ -69,14 +70,17 @@ export function bareDesktop(desktop, mount) {
     }
   };
   const restack = () => {
-    stacks.forEach((list, layer) => list.forEach((w, i) => { w.canvas.style.zIndex = String(2000000 + layer * 100000 + i); lift(w); }));
+    stacks.forEach((list, layer) => list.forEach((w, i) => {
+      w.canvas.style.zIndex = String(layer === 3 ? 1 + Math.min(i, 998) : 2000000 + layer * 100000 + i);
+      lift(w);
+    }));
   };
   const unstack = (win) => { for (const list of stacks) { const i = list.indexOf(win); if (i >= 0) list.splice(i, 1); } };
   // `below`: the stack id of the window this one is directly under; 0 the top
   // of its layer, 0xffffffff its bottom.
   const stackUnder = (win, below) => {
     unstack(win);
-    const list = stacks[Math.min(2, Math.max(0, win.layer | 0))];
+    const list = stacks[Math.min(3, Math.max(0, win.layer | 0))];
     if (below === 0xffffffff) list.unshift(win);
     else {
       const i = below ? list.findIndex((w) => w.stackId === below) : -1;

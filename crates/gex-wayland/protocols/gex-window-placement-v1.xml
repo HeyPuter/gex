@@ -22,7 +22,7 @@
     same space the client's own window system uses for a single screen.
   </description>
 
-  <interface name="gex_window_placement_manager_v1" version="2">
+  <interface name="gex_window_placement_manager_v1" version="3">
     <request name="destroy" type="destructor">
       <description summary="destroy the manager">
         Placement objects already made are unaffected.
@@ -40,11 +40,13 @@
     </request>
   </interface>
 
-  <interface name="gex_window_placement_v1" version="2">
+  <interface name="gex_window_placement_v1" version="3">
     <enum name="layer">
       <entry name="normal" value="0"/>
       <entry name="topmost" value="1" summary="above every normal window"/>
       <entry name="overlay" value="2" summary="above everything: menus, tooltips"/>
+      <entry name="desktop" value="3" since="3"
+             summary="below every other window, placed or not: the window system's desktop window"/>
     </enum>
 
     <request name="destroy" type="destructor">
