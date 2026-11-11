@@ -18880,8 +18880,18 @@ fn retire_noted(mm: &gex_kernel::mem::Mm, logged: Logged, recheck: &[(u64, u64)]
             };
             for w in &why {
                 for page in w.start / gex_abi::DISPATCH_PAGE..w.end.div_ceil(gex_abi::DISPATCH_PAGE) {
-                    // Pages kept (`keep_guarded`) are not counted.
-                    if page < gex_abi::dispatch_max_pages() && j.page_table.lookup(page).is_some() && retiring(page) {
+                    pwatch_say(page, || {
+                        format!(
+                            "{} of [{:#x}, {:#x}) prot {:#x} from pc {:#x}: {}",
+                            w.why, w.start, w.end, w.prot, w.pc,
+                            if retiring(page) { "retired" } else { "kept" }
+                        )
+                    });
+                    // Pages kept (`keep_guarded`) are not counted; a
+                    // page with code of either mode is (a WoW64 process's
+                    // 32-bit blocks are under `gex_abi::ALT_PAGE` alone).
+                    let translated = j.page_table.lookup(page).is_some() || j.page_table.lookup(page | gex_abi::ALT_PAGE).is_some();
+                    if page < gex_abi::dispatch_max_pages() && translated && retiring(page) {
                         note_page_retired(Some(mm), page, w);
                     }
                 }
