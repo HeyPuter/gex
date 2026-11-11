@@ -75,7 +75,7 @@ help-all: help
 	@echo 'make xwayland      Xwayland for the page alone'
 	@echo 'make toolchains    the pinned musl cross toolchains the page builds guest code with (CACHE/toolchains)'
 	@echo 'make serve         serve page/dist (PORT, default 8088) and page/dist-sp (SP_PORT, 8089)'
-	@echo 'make runtime       the npm package @gex/runtime (PKG=DIR, default out/runtime)'
+	@echo 'make runtime       the npm package @gexemu/runtime (PKG=DIR, default out/runtime)'
 	@echo 'make sysroot       the wasm32 sysroot (musl at MUSL_COMMIT); SNAPSHOT=1: the snapshot flavour'
 	@echo 'make sysroot64     the LP64 sysroot (musl at MUSL64_COMMIT)'
 	@echo 'make busybox       wasm32 busybox (BUSYBOX_VERSION, sha256-pinned)'

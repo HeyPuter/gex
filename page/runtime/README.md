@@ -1,4 +1,4 @@
-# @gex/runtime
+# @gexemu/runtime
 
 Linux programs in a web page: a kernel, the programs it runs, and their files.
 A page builds a `System`, gives it a filesystem, boots it, and runs programs in
@@ -7,8 +7,8 @@ loads. Windows, network, sound and GL are parts of their own, each a class that 
 argument.
 
 ```js
-import { System } from '@gex/runtime';
-import { MemoryFilesystem } from '@gex/runtime/fs';
+import { System } from '@gexemu/runtime';
+import { MemoryFilesystem } from '@gexemu/runtime/fs';
 
 const sys = new System();
 const fs = new MemoryFilesystem(sys);
@@ -44,10 +44,10 @@ page). A Debian tree of wasm32 packages with arm64 beside them (as
 debdemo builds one) runs apt as it comes, over the network below.
 
 ```js
-import { System } from '@gex/runtime';
-import { OPFSFilesystem } from '@gex/runtime/fs';
-import { Wisp } from '@gex/runtime/net/wisp';
-import { HostWindows } from '@gex/runtime/windows/host';
+import { System } from '@gexemu/runtime';
+import { OPFSFilesystem } from '@gexemu/runtime/fs';
+import { Wisp } from '@gexemu/runtime/net/wisp';
+import { HostWindows } from '@gexemu/runtime/windows/host';
 
 const sys = new System({ xcache: true });              // translated code kept across loads
 const fs = new OPFSFilesystem(sys, { name: 'debian' }); // the root, kept in the page's OPFS
@@ -171,7 +171,7 @@ processes and memory.
   them from `node_modules`. vite 7's dev server does not point a
   pre-bundled package's URLs back at it: there, the package fails to start
   unless it is left out of pre-bundling
-  (`optimizeDeps: { exclude: ['@gex/runtime'] }`); vite 7's build works as
+  (`optimizeDeps: { exclude: ['@gexemu/runtime'] }`); vite 7's build works as
   it is. Every Worker is one file with no imports, so a bundler's default
   classic-script Workers build too. No file becomes a `data:` URL.
 - Served without a bundler, from any directory, the modules find their
@@ -271,7 +271,7 @@ blocks of 64 KiB as its cache fills and empties, one call at a time. Its
 constructor takes `cache`, `writeback` and `exclude` as `OPFSFilesystem`'s
 does. Its bytes are the root as a load before kept it: a store that is to
 start over empties itself in `open()`. It needs the default
-build: in the single-thread one (`@gex/runtime-single`) the boot rejects it,
+build: in the single-thread one (`@gexemu/runtime-single`) the boot rejects it,
 and the built-ins are the choice.
 
 | Method | Does |
@@ -286,8 +286,8 @@ Each is async. An error with `code: 'ENOSPC'` is a full store to the
 program that wrote; any other error is `EIO`.
 
 ```js
-import { System } from '@gex/runtime';
-import { Filesystem } from '@gex/runtime/fs';
+import { System } from '@gexemu/runtime';
+import { Filesystem } from '@gexemu/runtime/fs';
 
 const PIECE = 1 << 20;
 // The files' contents in 1 MiB pieces the page keeps (in a Map here).
@@ -403,8 +403,8 @@ system booted on a store another tab of the site holds fails at once with
 offer to run without keeping files: its `onStoreBusy` option.)
 
 ```js
-import { System } from '@gex/runtime';
-import { OPFSFilesystem } from '@gex/runtime/fs';
+import { System } from '@gexemu/runtime';
+import { OPFSFilesystem } from '@gexemu/runtime/fs';
 
 const sys = new System();
 const fs = new OPFSFilesystem(sys, { name: 'my-tree' });  // kept as 'my-tree'
@@ -475,14 +475,14 @@ reached from the page with `connectGuest` (below), not through the network;
 a program's `shutdown(SHUT_WR)` does not reach the page; UDP from a far
 address the program did not send to first.
 
-**Wisp.** `@gex/runtime/net/wisp` is a network over a
+**Wisp.** `@gexemu/runtime/net/wisp` is a network over a
 [Wisp](https://github.com/MercuryWorkshop/wisp-protocol) proxy, with
 MercuryWorkshop's wisp-js client: every connection on one WebSocket, dialled
 again when it drops. It is an implementation of the interface above, and
 only a page that imports it carries wisp-js.
 
 ```js
-import { Wisp } from '@gex/runtime/net/wisp';
+import { Wisp } from '@gexemu/runtime/net/wisp';
 sys.network = new Wisp('wss://wisp.example/');
 ```
 
@@ -530,7 +530,7 @@ pointer or key event after it resumes the context). One per system, made
 any time.
 
 ```js
-import { WebAudio } from '@gex/runtime/audio';
+import { WebAudio } from '@gexemu/runtime/audio';
 button.onclick = () => new WebAudio(sys);
 ```
 
@@ -551,8 +551,8 @@ before compression. It is fetched when a program first opens its GL, or
 at `start()`, not at boot.
 
 ```js
-import { MesaGl } from '@gex/runtime/gl';
-import { HostWindows } from '@gex/runtime/windows/host';
+import { MesaGl } from '@gexemu/runtime/gl';
+import { HostWindows } from '@gexemu/runtime/windows/host';
 const hw = new HostWindows(sys);  // the windows GL draws into
 const gl = new MesaGl(sys);       // before boot
 ```
@@ -566,7 +566,7 @@ const gl = new MesaGl(sys);       // before boot
 ## Input
 
 The input a browser holds back until the page asks for it, from
-`@gex/runtime/input`. Each is made any time, one per system.
+`@gexemu/runtime/input`. Each is made any time, one per system.
 
 `new PointerLock(sys)`: a click on a window whose program asks for a locked
 pointer takes the browser's pointer lock. The program asks through Wayland's
@@ -629,13 +629,13 @@ runtime's own X server (Xwayland, rootless, gex's window manager framing
 nothing), started when the first X client connects, which waits for it. The
 tree needs only the clients' libraries.
 
-### HostWindows (`@gex/runtime/windows/host`)
+### HostWindows (`@gexemu/runtime/windows/host`)
 
 Each guest window is handed to the page to frame and place, as a desktop's
 window manager does.
 
 ```js
-import { HostWindows } from '@gex/runtime/windows/host';
+import { HostWindows } from '@gexemu/runtime/windows/host';
 const hw = new HostWindows(sys, { width: 1280, height: 720 });
 hw.addEventListener('window', ({ window: w }) => {
   if (w.kind === 'toplevel' && w.decorations === 'host') frame(w);   // a title bar, w.canvas inside
@@ -672,7 +672,7 @@ sys.spawn(['foot'], { env: { PATH: '/usr/bin:/bin', ...hw.env } });
 | `appId` | What application it is, or `null` when the program does not say: a Wayland window's app id (by convention its desktop entry's name, `org.kde.kate`), an X window's `WM_CLASS` class (what a desktop entry's `StartupWMClass` names, `XTerm`). |
 | Events | `title`, `appid`, `resized`, `position`, `restack` (`below`), `request` (`kind`: `'move'`, `'resize'` with `edges`, `'maximize'`, `'unmaximize'`, `'minimize'`, `'fullscreen'`, `'unfullscreen'`: from the client's own frame), `closed`. |
 
-### SingleCanvas (`@gex/runtime/windows/single`)
+### SingleCanvas (`@gexemu/runtime/windows/single`)
 
 `new SingleCanvas(sys, { container })`: the windows drawn straight into one
 positioned element, unframed, the first at its corner, popups over their
@@ -681,7 +681,7 @@ is the output's; call `resized()` after changing it. For a page that is one
 program (a game, a Win32 program that draws its own frames). `env`,
 `describe()` and a `change` event as windows come and go.
 
-### CompositorWindows (`@gex/runtime/windows/compositor`)
+### CompositorWindows (`@gexemu/runtime/windows/compositor`)
 
 `new CompositorWindows(sys, { canvas, scale, x11 })`: the whole desktop in one
 canvas, drawn by gex's scene compositor on WebGPU in a Worker: frames, title

@@ -1,4 +1,4 @@
-// @gex/runtime: the System and the programs it runs. README.md says what
+// @gexemu/runtime: the System and the programs it runs. README.md says what
 // each does; these are its shapes.
 
 import type { Network } from './net';

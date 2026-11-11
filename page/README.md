@@ -1,6 +1,6 @@
 # web
 
-gex in a browser: the runtime API (`runtime/`, the `@gex/runtime`
+gex in a browser: the runtime API (`runtime/`, the `@gexemu/runtime`
 package, `runtime/README.md`, built by `make runtime PKG=DIR`), gex's test page (`index.html`,
 `src/harness.js`), the library an ejected program ships, and the builds of
 what they load:

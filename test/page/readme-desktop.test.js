@@ -14,10 +14,10 @@ export const meta = {
 
 // The README's module specifiers, and the runtime's sources they are.
 const MODULES = {
-  '@gex/runtime': 'index.js',
-  '@gex/runtime/fs': 'fs.js',
-  '@gex/runtime/net/wisp': 'net/wisp.mjs',
-  '@gex/runtime/windows/host': 'windows/host.js',
+  '@gexemu/runtime': 'index.js',
+  '@gexemu/runtime/fs': 'fs.js',
+  '@gexemu/runtime/net/wisp': 'net/wisp.mjs',
+  '@gexemu/runtime/windows/host': 'windows/host.js',
 };
 // `--package`: the built entries instead (lib/package.mjs's names).
 const BUILT = { 'index.js': 'index.mjs', 'fs.js': 'fs.mjs', 'net/wisp.mjs': 'net-wisp.mjs', 'windows/host.js': 'windows-host.mjs' };

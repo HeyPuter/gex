@@ -24,7 +24,7 @@ import files from './runtime-files.js';
 import { SP_CODE, MP_CODE } from '../../../hosts/browser/js/mode.mjs';
 import { serveSlots, claimStore, storeBusy } from '../../../hosts/browser/js/blocks.mjs';
 
-/** Whether this system is the single-thread build's (@gex/runtime-single:
+/** Whether this system is the single-thread build's (@gexemu/runtime-single:
  *  the kernel and every process in one Worker, kernel-single-worker.js): a
  *  package is one build or the other, and the source tree runs it where the
  *  page has no SharedArrayBuffer. */
@@ -331,7 +331,7 @@ export class System extends EventTarget {
     if (!SINGLE && typeof SharedArrayBuffer !== 'function') {
       throw new Error(SP_CODE
         ? 'the gex runtime needs a cross-origin isolated page (Cross-Origin-Opener-Policy: same-origin, Cross-Origin-Embedder-Policy: require-corp), or JSPI for the single-thread build'
-        : 'the gex runtime needs a cross-origin isolated page (Cross-Origin-Opener-Policy: same-origin, Cross-Origin-Embedder-Policy: require-corp); @gex/runtime-single runs without');
+        : 'the gex runtime needs a cross-origin isolated page (Cross-Origin-Opener-Policy: same-origin, Cross-Origin-Embedder-Policy: require-corp); @gexemu/runtime-single runs without');
     }
     // The single-thread build's system Worker, now: its modules load while
     // the files below are got ready.

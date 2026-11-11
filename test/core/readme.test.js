@@ -3,7 +3,7 @@
 // page/runtime/README.md, in its order; a page has one System, so each phase
 // (t.reload) runs the blocks that share one. What an example takes from the
 // page around it (a terminal widget, a desktop's frames, a button) is a stub
-// here; its `@gex/runtime` imports are the runtime's modules; its trees are the
+// here; its `@gexemu/runtime` imports are the runtime's modules; its trees are the
 // slim Debian image (bash, uname). A block the README gains or loses fails
 // the block count, so a new example is never left unrun.
 import readme from '../../page/runtime/README.md?raw';
@@ -21,9 +21,9 @@ import { SP_CODE, MP_CODE } from '../../hosts/browser/js/mode.mjs';
 export const meta = { hosts: ['browser'], images: ['slim'], timeout: 600 };
 
 const M = {
-  '@gex/runtime': index, '@gex/runtime/fs': fsMod, '@gex/runtime/windows/host': host,
-  '@gex/runtime/windows/single': single, '@gex/runtime/windows/compositor': compositor,
-  '@gex/runtime/net/wisp': wisp, '@gex/runtime/audio': audio, '@gex/runtime/gl': gl, '@gex/runtime/input': input,
+  '@gexemu/runtime': index, '@gexemu/runtime/fs': fsMod, '@gexemu/runtime/windows/host': host,
+  '@gexemu/runtime/windows/single': single, '@gexemu/runtime/windows/compositor': compositor,
+  '@gexemu/runtime/net/wisp': wisp, '@gexemu/runtime/audio': audio, '@gexemu/runtime/gl': gl, '@gexemu/runtime/input': input,
 };
 // The single-thread build (system.js `SINGLE`).
 const SINGLE = !MP_CODE || (SP_CODE && typeof SharedArrayBuffer !== 'function');
@@ -128,7 +128,7 @@ export default async function (t) {
   const phase = PHASES[t.phase - 1];
   const tree = t.work('slim/debian-slim.tar.zst');
   await phase.before?.();
-  const pre = phase.pre === undefined ? '' : `const { System } = M['@gex/runtime']; const { MemoryFilesystem } = M['@gex/runtime/fs'];
+  const pre = phase.pre === undefined ? '' : `const { System } = M['@gexemu/runtime']; const { MemoryFilesystem } = M['@gexemu/runtime/fs'];
 const sys = new System({ baseUrl: BASE, debug: DEBUG }); const fs = new MemoryFilesystem(sys); fs.addTar(${JSON.stringify(tree)});
 ${phase.pre === 'booted' ? 'await sys.boot();' : ''}`;
   const parts = [STUBS, pre, ...phase.blocks.map((i) => prepare(BLOCKS[i], tree))];

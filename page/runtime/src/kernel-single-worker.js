@@ -1,4 +1,4 @@
-// The single-thread build's system Worker (@gex/runtime-single): the global
+// The single-thread build's system Worker (@gexemu/runtime-single): the global
 // kernel and every guest process, in one realm with no SharedArrayBuffer.
 // A process's threads are fibers of this Worker (single.mjs), each on its
 // own JSPI stack, and every memory is a plain one that only this thread

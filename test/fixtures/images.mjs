@@ -13,7 +13,7 @@
 //   slim     slim/ (debian-slim.tar.zst, repo/) from GEX_TEST_SLIM, and
 //            slim-repo.json listing the repository.
 //   package  pkg/: the runtime package, page/runtime/build.sh (--single:
-//            @gex/runtime-single).
+//            @gexemu/runtime-single).
 //   win-progs  win-progs.tar: the Windows test programs (fixtures/wine/src)
 //            built with MinGW for x64/ and x86/ (a source's `gex-nt-cc:`,
 //            `gex-nt-arch:`, `gex-nt-libs:` and `gex-nt-shared` lines: its
@@ -553,7 +553,7 @@ export const images = {
   },
 
   // `single`: the runner's --single, whose pages have no SharedArrayBuffer:
-  // @gex/runtime-single.
+  // @gexemu/runtime-single.
   async package(work, { single = false } = {}) {
     execFileSync(join(ROOT, 'page/runtime/build.sh'), [...(single ? ['--single'] : []), join(work, 'pkg')], { stdio: ['ignore', 'ignore', 'inherit'] });
     // A copy without the memory64 shim, for core/mem64-missing.

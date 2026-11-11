@@ -53,7 +53,7 @@ if (PACKAGE && !existsSync(join(PACKAGE, 'index.mjs'))) throw new Error(`--packa
 // `--single`: the single-thread build. Its pages are served without
 // cross-origin isolation, so they have no SharedArrayBuffer: the runtime from
 // source runs that build, and so must a package (--package, as
-// `page/runtime/build.sh --single` builds @gex/runtime-single). Browser only.
+// `page/runtime/build.sh --single` builds @gexemu/runtime-single). Browser only.
 // A test the single-thread build cannot run yet says why in its meta
 // (`single: 'why'`) and is skipped; one that needs longer there says so
 // (`singleTimeout`, seconds, in place of `timeout`).

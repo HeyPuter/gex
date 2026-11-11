@@ -12,9 +12,9 @@
 #
 #   page/runtime/build.sh [--single] DIR
 #
-# Two packages, one build each. @gex/runtime (the default) is for a
+# Two packages, one build each. @gexemu/runtime (the default) is for a
 # cross-origin isolated page: SharedArrayBuffer, a Worker per guest thread.
-# @gex/runtime-single (--single) is for a page without SharedArrayBuffer:
+# @gexemu/runtime-single (--single) is for a page without SharedArrayBuffer:
 # the system in one Worker, every guest thread a fiber of it (JSPI), its GL
 # the single-thread Mesa (gex/st/). Each carries only its own code: the
 # build's hosts/browser/js/mode.mjs says which (SP_CODE, MP_CODE), the
@@ -240,8 +240,8 @@ console.log(`page/runtime/build.sh: wisp-js only in net-wisp.mjs; none in the ${
 JS
 
 VERSION=$(cd "$WEB" && node -p "require('./package.json').version ?? '0.0.0'" 2>/dev/null || echo 0.0.0)
-NAME=@gex/runtime DESC="Linux programs in the browser: a kernel, the programs it runs, and their files"
-[ $MODE = mp ] || NAME=@gex/runtime-single DESC="Linux programs in the browser, on a page without SharedArrayBuffer: a kernel, the programs it runs, and their files"
+NAME=@gexemu/runtime DESC="Linux programs in the browser: a kernel, the programs it runs, and their files"
+[ $MODE = mp ] || NAME=@gexemu/runtime-single DESC="Linux programs in the browser, on a page without SharedArrayBuffer: a kernel, the programs it runs, and their files"
 cat > "$OUT/package.json" <<PKG
 {
   "name": "$NAME",
