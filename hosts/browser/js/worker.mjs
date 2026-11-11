@@ -1581,8 +1581,11 @@ async function handle(msg) {
     // shim reaches the host as `unreachable`, and the guest pc and object are
     // readable here and nowhere else.
     let where = '';
+    // A process that outgrew its lowered memory (gex.mjs, `outgrew`): its
+    // end is said once, as the kernel records it, with no crash evidence.
+    const outgrew = !!e?.outgrew;
     try {
-      const ex = inert ? null : gex.shim?.exports;
+      const ex = inert || outgrew ? null : gex.shim?.exports;
       // Only if this Worker got as far as having a kernel: a failure during
       // load left no host, and `gex_current_pc` panicking on the way in
       // replaced the real error with a bare `unreachable`.
@@ -1620,7 +1623,7 @@ async function handle(msg) {
     // Always, not under a flag: the evidence above was printed only under
     // `GEX_DEBUG_EXIT` and thrown away otherwise. A debug switch should add
     // detail to a failure, never be the condition for seeing one.
-    console.error(`gex: worker threw: ${e?.message ?? e}${where}\n${e?.stack ?? ''}`);
+    if (!outgrew) console.error(`gex: worker threw: ${e?.message ?? e}${where}\n${e?.stack ?? ''}`);
     // Before the message: until the table knows this process is gone, its
     // parent's `wait4` is parked on a child that will never report. See
     // `gex_abandon` -- #69.
@@ -1629,7 +1632,7 @@ async function handle(msg) {
       // Not for an instance with no slot: its thread never ran, and the
       // process runs on in its other Workers.
       if (!inert) {
-        gex?.shim?.exports?.gex_dump_state?.();
+        if (!outgrew) gex?.shim?.exports?.gex_dump_state?.();
         const abandon = gex?.shim?.exports?.gex_abandon;
         // In the single-thread build the kernel's calls may suspend, which
         // needs a stack of its own (`WebAssembly.promising`).
@@ -1643,7 +1646,8 @@ async function handle(msg) {
     port.post({
       kind: 'threw',
       message: (e?.message ?? String(e)) + where,
-      stack: e?.stack ?? '',
+      stack: outgrew ? '' : e?.stack ?? '',
+      outgrew: outgrew || undefined,
     });
     // The trap abandoned this instance's stack; its slot is free for the next.
     gex?.releaseWorker?.(true);

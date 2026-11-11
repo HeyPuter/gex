@@ -3115,8 +3115,19 @@ fn arena_note(who: usize, len: u64) {
 static ARENA_NEXT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// The largest span of arena gex's own memory (this module's heap, a
+/// Worker's stack) asked for and did not get: the trap that follows is the
+/// process outgrowing its lowered memory ([`runtime_outgrow`]).
+static RUNTIME_SHORT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Take `len` bytes of arena for this module's heap.
 fn arena_take(len: u64) -> Option<u64> {
+    arena_take_for(len, false)
+}
+
+/// Take `len` bytes of arena: for a guest mapping (`guest`, whose refusal
+/// the guest hears as ENOMEM), else for gex's own memory.
+fn arena_take_for(len: u64, guest: bool) -> Option<u64> {
     let cur = ARENA_NEXT.load(std::sync::atomic::Ordering::Acquire);
     // First claim starts above both the placement window (where shared objects
     // sit at a common address) and whatever the memory already reaches. The
@@ -3168,6 +3179,9 @@ fn arena_take(len: u64) -> Option<u64> {
     // No line from here: this is the allocator's refill path (see below).
     HEAP_REACH.fetch_max(end, std::sync::atomic::Ordering::Relaxed);
     if end > winspace::arena_ceiling() || !grow_memory_to(end) {
+        if !guest {
+            RUNTIME_SHORT.fetch_max(len, std::sync::atomic::Ordering::Relaxed);
+        }
         // Out loud, because the caller turns `None` into `handle_alloc_error`,
         // which aborts past the panic hook as a bare `unreachable` with nothing
         // printed. This is the only place that knows the arena ran out -- and
@@ -3274,8 +3288,15 @@ fn arena_take(len: u64) -> Option<u64> {
             BIG_SIZE_N[7].load(std::sync::atomic::Ordering::Relaxed),
             BIG_SIZES[7].load(std::sync::atomic::Ordering::Relaxed),
         );
-        // SAFETY: `warn` reads the bytes and keeps none of them.
-        unsafe { warn(b.0.as_ptr() as u32, b.1 as u32) };
+        // Debug output for gex's own memory in a process that can move to
+        // a 64-bit memory: the trap that follows is its outgrowing the
+        // lowered one, which the kernel's line says (`runtime_outgrow`).
+        // SAFETY: `warn` and `debug` read the bytes and keep none of them.
+        if !guest && gex_kernel::syscalls::outgrow_armed(my_pid(), WASM32.load(std::sync::atomic::Ordering::Acquire)) {
+            unsafe { debug(b.0.as_ptr() as u32, b.1 as u32) };
+        } else {
+            unsafe { warn(b.0.as_ptr() as u32, b.1 as u32) };
+        }
         return None;
     }
     // A compare-and-swap, not a bare store: two Workers that loaded the same
@@ -3291,7 +3312,7 @@ fn arena_take(len: u64) -> Option<u64> {
     if memmap::take_span(&ARENA_NEXT, cur, at, len) {
         Some(at)
     } else {
-        arena_take(len)
+        arena_take_for(len, guest)
     }
 }
 
@@ -3430,7 +3451,7 @@ static HIGH_NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::n
 /// The same cursor this module's heap takes from, so the two can never hand
 /// out the same bytes. Zero means the memory would not grow.
 fn arena_grow(len: u64) -> u64 {
-    let at = arena_take(len).unwrap_or(0);
+    let at = arena_take_for(len, true).unwrap_or(0);
     if at != 0 {
         arena_note(0, len);
         wine32_note_reach(at + len, "the kernel's arena", at, at + len);
@@ -20499,6 +20520,7 @@ pub extern "C" fn gex_abandon(code: i32) {
     // no longer exists and the parent's `read` never returns: the run wedges
     // one process further along than the one that died, which is the shape
     // that made a lifter fault in a forked child look like a hang in `apt`.
+    let _ = runtime_outgrow(pid);
     outgrow_end(pid, code);
     hold_wakes();
     if let Some(fds) = fds_free() {
@@ -20544,6 +20566,32 @@ fn outgrow_end(pid: i32, status: i32) {
         let word = if status < 0 { (-status) & 0x7f } else { (status & 0xff) << 8 };
         gex_kernel::syscalls::outgrow_ending(pid, word, home.procs());
     }
+}
+
+/// Process `pid`, ending after a trap, ran out of gex's own memory in its
+/// lowered memory ([`RUNTIME_SHORT`]): it outgrew it, as a program whose
+/// reservation did not fit does, and is recorded for a 64-bit memory at
+/// its next start (`outgrow_ending`, which [`outgrow_end`] calls next).
+fn runtime_outgrow(pid: i32) -> bool {
+    let len = RUNTIME_SHORT.swap(0, std::sync::atomic::Ordering::Relaxed);
+    if len == 0 || !gex_kernel::syscalls::note_runtime_short(pid, len, WASM32.load(std::sync::atomic::Ordering::Acquire)) {
+        return false;
+    }
+    if let Some(home) = sigs::home() {
+        home.procs().set_crash_unless_said(pid, b"\0its memory ran out");
+    }
+    true
+}
+
+/// Whether this process's trap is its outgrowing its lowered memory
+/// ([`runtime_outgrow`]): gex's own memory could not grow, and the process
+/// can move to a 64-bit memory. Asked by the Worker before it says
+/// anything of the trap; a plain read of statics, and the record's lock
+/// tried.
+#[no_mangle]
+pub extern "C" fn gex_outgrew() -> i32 {
+    (RUNTIME_SHORT.load(std::sync::atomic::Ordering::Relaxed) != 0
+        && gex_kernel::syscalls::outgrow_armed(my_pid(), WASM32.load(std::sync::atomic::Ordering::Acquire))) as i32
 }
 
 /// Record a guest exit, and say so where a trap handler can see it.
@@ -20629,6 +20677,7 @@ pub extern "C" fn gex_process_gone(status: i32) -> u32 {
     set_exited(true);
     waitq::wake_process();
     let pid = my_pid();
+    let outgrew = runtime_outgrow(pid);
     outgrow_end(pid, status);
     let n = unsafe {
         if k_present() != 0 {
@@ -20643,9 +20692,10 @@ pub extern "C" fn gex_process_gone(status: i32) -> u32 {
         home.procs().set_crash_unless_said(pid, b"\0gex could not run it on");
     }
     publish_exit(pid, status);
-    warn_line(&format!(
-        "[gex] pid {pid} crashed; {n} pipe ends released, status {status}\n"
-    ));
+    // (one that outgrew its memory: the kernel's line said so)
+    if !outgrew {
+        warn_line(&format!("[gex] pid {pid} crashed; {n} pipe ends released, status {status}\n"));
+    }
     n
 }
 

@@ -2232,7 +2232,8 @@ export class ProcessHost {
         this.#release(pid, w);
         // Here as well as in the Worker: only this side knows which process
         // fell over, and a child's promise often has nobody awaiting it.
-        console.error(`[gex] pid ${pid} threw: ${m.message}\n${m.stack ?? ''}`);
+        // (one that outgrew its lowered memory: the kernel's line says so)
+        if (!m.outgrew) console.error(`[gex] pid ${pid} threw: ${m.message}\n${m.stack ?? ''}`);
         // As an event: the console line is INFO to a watcher and easy to miss.
         // See task 146.
         crashed(`pid ${pid} threw: ${m.message}`);

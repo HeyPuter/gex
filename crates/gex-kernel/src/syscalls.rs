@@ -932,6 +932,9 @@ struct Outgrow {
     /// call that asked has taken it.
     ended: bool,
     end: bool,
+    /// gex's own memory for it ran out in the lowered memory
+    /// ([`note_runtime_short`]): it ends for that, whatever its status.
+    runtime: bool,
 }
 
 static OUTGROW: crate::sync::Mutex<Vec<Outgrow>> = crate::sync::Mutex::new(Vec::new());
@@ -998,6 +1001,36 @@ pub fn outgrow_take_end(pid: i32) -> bool {
     OUTGROW.lock().iter_mut().find(|o| o.pid == pid).is_some_and(|o| std::mem::take(&mut o.end))
 }
 
+/// gex's own memory for process `pid` (the runtime's heap, a Worker's
+/// stack) could not grow by `len` bytes in its lowered memory, and the
+/// process cannot go on: recorded as a reservation that did not fit, which
+/// ends it whatever its status ([`outgrow_ending`]). Whether it was
+/// recorded: false for a process with no record (a 32-bit guest, one in a
+/// 64-bit memory or asked to stay out of one), or with the record's lock
+/// held where it ran out. Takes no other lock.
+pub fn note_runtime_short(pid: i32, len: u64, wasm32: bool) -> bool {
+    if gex_abi::mem64() || wasm32 {
+        return false;
+    }
+    let Some(mut all) = OUTGROW.try_lock() else { return false };
+    let Some(o) = all.iter_mut().find(|o| o.pid == pid && !o.stay32) else { return false };
+    let len = len.clamp(OUTGROW_MIN, OUTGROW_MAX);
+    if o.short.is_none_or(|(had, _)| len > had) {
+        o.short = Some((len, raw_ns(o.clock)));
+    }
+    o.runtime = true;
+    true
+}
+
+/// Whether [`note_runtime_short`] would record process `pid`, and its host
+/// can move it to a 64-bit memory. No lock but the record's, tried.
+pub fn outgrow_armed(pid: i32, wasm32: bool) -> bool {
+    if gex_abi::mem64() || wasm32 || !OUTGROW_HOST.get().is_some_and(|h| (h.reachable)()) {
+        return false;
+    }
+    OUTGROW.try_lock().is_some_and(|all| all.iter().any(|o| o.pid == pid && !o.stay32))
+}
+
 /// Process `pid` is ending with wait status `status`. One that fell short
 /// of address space ([`Kernel::note_short`]) and ends abnormally (a signal
 /// that dumps core, or a nonzero exit) within [`OUTGROW_WINDOW_NS`] of it
@@ -1020,6 +1053,7 @@ pub fn outgrow_ending(pid: i32, status: i32, procs: &crate::proc::ProcTable) {
     let Some((len, at)) = rec.short else { return };
     let sig = (status & 0x7f) as u32;
     let abnormal = rec.ended
+        || rec.runtime
         || match sig {
             0 => (status >> 8) & 0xff != 0,
             0x7f => false,
@@ -1038,11 +1072,12 @@ pub fn outgrow_ending(pid: i32, status: i32, procs: &crate::proc::ProcTable) {
     };
     let line = match set {
         Ok(()) => {
-            (host.say)(&format!(
-                "{} needs 64-bit memory (a reservation of {:#x} bytes did not fit); it gets it from its next start\n",
-                rec.image.as_deref().unwrap_or(""),
-                len
-            ));
+            let why = if rec.runtime {
+                format!("gex's own memory for it could not grow by {len:#x} bytes")
+            } else {
+                format!("a reservation of {len:#x} bytes did not fit")
+            };
+            (host.say)(&format!("{} needs 64-bit memory ({why}); it gets it from its next start\n", rec.image.as_deref().unwrap_or("")));
             "needs 64-bit memory; it will get it the next time it starts".to_string()
         }
         Err(e) => {
@@ -10088,13 +10123,13 @@ impl Kernel {
         let stay32 = self.exec_mem64 == Some(false);
         let mut all = OUTGROW.lock();
         match all.iter_mut().find(|o| o.pid == self.pid) {
-            Some(o) if exec => *o = Outgrow { pid: self.pid, image, stay32, ns: Arc::clone(self.vfs.view()), clock: self.clock, short: None, last: 0, ended: false, end: false },
+            Some(o) if exec => *o = Outgrow { pid: self.pid, image, stay32, ns: Arc::clone(self.vfs.view()), clock: self.clock, short: None, last: 0, ended: false, end: false, runtime: false },
             Some(o) => {
                 if o.image.is_none() {
                     o.image = image;
                 }
             }
-            None => all.push(Outgrow { pid: self.pid, image, stay32, ns: Arc::clone(self.vfs.view()), clock: self.clock, short: None, last: 0, ended: false, end: false }),
+            None => all.push(Outgrow { pid: self.pid, image, stay32, ns: Arc::clone(self.vfs.view()), clock: self.clock, short: None, last: 0, ended: false, end: false, runtime: false }),
         }
     }
 

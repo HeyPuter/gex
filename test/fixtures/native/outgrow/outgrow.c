@@ -3,6 +3,12 @@
  *
  *   outgrow crash      no room: says "outgrow short", then aborts
  *   outgrow fallback   no room: maps 64 MiB instead and exits 0
+ *   outgrow runtime    writes a million small functions, fills the rest
+ *                      of its memory with 1 MiB mappings (each too small
+ *                      to count as falling short), says "outgrow runtime
+ *                      full", then calls the functions one by one: their
+ *                      translations take gex's own memory, which has no
+ *                      room left, so it never says "outgrow runtime ran"
  *   outgrow twice M    runs `outgrow M` twice, one after the other (an
  *                      exec each, as a shell would), and says how each
  *                      ended and whether the program is recorded for a
@@ -46,6 +52,33 @@ int main(int argc, char **argv) {
         return 0;
     }
     const char *mode = argc > 1 ? argv[1] : "crash";
+    if (!strcmp(mode, "runtime")) {
+        void *hi = mmap((void *)(1ull << 33), 1 << 20, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (hi != MAP_FAILED && (uintptr_t)hi >= (1ull << 32)) {
+            printf("outgrow big high\n");
+            return 0;
+        }
+        /* mov eax, i; ret -- each at its own 16 bytes */
+        enum { FUNCS = 1 << 20 };
+        unsigned char *code = mmap(0, FUNCS * 16, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (code == MAP_FAILED) return 2;
+        for (unsigned i = 0; i < FUNCS; i++) {
+            unsigned char *f = code + i * 16;
+            f[0] = 0xb8;
+            memcpy(f + 1, &i, 4);
+            f[5] = 0xc3;
+        }
+        mprotect(code, FUNCS * 16, PROT_READ | PROT_EXEC);
+        while (mmap(0, 1 << 20, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0) != MAP_FAILED)
+            ;
+        printf("outgrow runtime full\n");
+        fflush(stdout);
+        unsigned sum = 0;
+        for (unsigned i = 0; i < FUNCS; i++)
+            sum += ((unsigned (*)(void))(code + i * 16))();
+        printf("outgrow runtime ran %u\n", sum);
+        return 0;
+    }
     void *p = mmap(0, BIG, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (p != MAP_FAILED) {
         printf("outgrow big %s\n", (uintptr_t)p >= (1ull << 32) ? "high" : "low");

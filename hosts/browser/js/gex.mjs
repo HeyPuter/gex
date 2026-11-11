@@ -8430,6 +8430,13 @@ export class Gex {
             }
           };
           const e = this.#shim.exports;
+          // gex's own memory ran out in the process's lowered memory: it
+          // outgrew it, and moves to a 64-bit memory at its next start
+          // (lib.rs `gex_outgrew`). One line, said as the Worker ends it;
+          // none of the runtime crash's evidence.
+          if (ask(e.gex_outgrew, (v) => v) === 1) {
+            throw Object.assign(new Error('its memory ran out: gex could not grow its own memory for it below the 32-bit ceiling'), { outgrew: true });
+          }
           const at = ask(e.gex_current_pc, (pc) =>
             `, guest pc=0x${(pc < 0n ? pc + (1n << 64n) : pc).toString(16)}`);
           const lr = ask(e.gex_current_lr, (lr) =>
