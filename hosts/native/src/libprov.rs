@@ -236,10 +236,51 @@ pub(crate) fn alloc_below_2g(state: &mut HostState, size: u64, name: &str) -> Re
     bail!("mapping {name}: no {len:#x} bytes free in [{FLOOR:#x}, {:#x})", gex_abi::KUSER_WINDOWS)
 }
 
-/// [`alloc_above_code`] for a native module's data, noted for Wine's views.
+/// 64-bit Wine: the window for its PE modules' data ([`alloc_above_code_data`]),
+/// reserved when its program is placed ([`reserve_pe_data`]), before any
+/// Windows mapping: above Wine's code space, so above every image. On
+/// demand, a program that reserves all it can of the space above 2 GiB
+/// (a runtime's heap) left no room for the next module's data, and its
+/// process ended. 8 MiB: the core's and every Wine module of its own a
+/// process loads, packed by the page.
+pub(crate) const PE_DATA: (u64, u64) = (0x8000_0000, 0x8080_0000);
+const PE_DATA_NAME: &str = "[w64 PE data window]";
+
+/// Reserve [`PE_DATA`] (no access until data is placed in it).
+pub(crate) fn reserve_pe_data(state: &mut HostState) {
+    use gex_kernel::mem::{flags, prot};
+    let (lo, hi) = PE_DATA;
+    if let Err(e) = map_anon(state, lo, hi - lo, prot::NONE, flags::FIXED_NOREPLACE, false, PE_DATA_NAME) {
+        eprintln!("gex: wine64: reserving the PE data window {lo:#x}..{hi:#x}: errno {}", e.0);
+    }
+}
+
+/// `len` bytes of [`PE_DATA`], from the top of what is still reserved there
+/// down. The map says what is left, so a forked child goes on from its
+/// parent's.
+fn alloc_pe_data_window(state: &mut HostState, len: u64, name: &str) -> Option<u64> {
+    use gex_kernel::mem::{flags, prot};
+    let (lo, hi) = PE_DATA;
+    let at = state.with_kernel(|k| {
+        let mm = k.mem.lock();
+        mm.vmas()
+            .iter()
+            .filter(|v| v.start >= lo && v.end <= hi && v.name == PE_DATA_NAME && v.end - v.start >= len)
+            .map(|v| v.end - len)
+            .max()
+    })?;
+    map_anon(state, at, len, prot::READ | prot::WRITE, flags::FIXED, false, name).ok()
+}
+
+/// [`alloc_above_code`] for a native module's data, noted for Wine's views:
+/// in [`PE_DATA`] while it has room.
 pub(crate) fn alloc_above_code_data(state: &mut HostState, size: u64, name: &str) -> Result<u64> {
-    let at = alloc_above_code(state, size, name)?;
-    note_host_data(state, at, (size + 0xffff) & !0xffff);
+    let page = (size + 0xfff) & !0xfff;
+    let (at, len) = match alloc_pe_data_window(state, page, name) {
+        Some(at) => (at, page),
+        None => (alloc_above_code(state, size, name)?, (size + 0xffff) & !0xffff),
+    };
+    note_host_data(state, at, len);
     Ok(at)
 }
 
