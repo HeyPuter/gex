@@ -3105,6 +3105,8 @@ static HEAP_BIGGEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 /// Bytes held by `Jit::registry`, for the arena report.
 static REGISTRY_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// A span of `len` bytes `who` took ([`ARENA_SPENT`]'s index): counted once
+/// taken, so that claims the arena refused do not add to what it spent.
 fn arena_note(who: usize, len: u64) {
     ARENA_SPENT[who].fetch_add(len, std::sync::atomic::Ordering::Relaxed);
     ARENA_SPENT[3].fetch_max(len, std::sync::atomic::Ordering::Relaxed);
@@ -3182,6 +3184,13 @@ fn arena_take(len: u64) -> Option<u64> {
                 self.1 += n;
                 Ok(())
             }
+        }
+        // Once a process: a program refused may ask again (the kernel ends
+        // one that asks for as much again: `note_short`), and each refusal
+        // after the first says nothing new.
+        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            return None;
         }
         // Sized generously: `write!` into a full buffer stops silently, so the
         // last field added is the first lost and reads as absent, not truncated.
@@ -3415,9 +3424,9 @@ static HIGH_NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::n
 /// The same cursor this module's heap takes from, so the two can never hand
 /// out the same bytes. Zero means the memory would not grow.
 fn arena_grow(len: u64) -> u64 {
-    arena_note(0, len);
     let at = arena_take(len).unwrap_or(0);
     if at != 0 {
+        arena_note(0, len);
         wine32_note_reach(at + len, "the kernel's arena", at, at + len);
     }
     if at != 0 {
@@ -3500,7 +3509,6 @@ unsafe impl<const BIG: bool> talc::source::Source for ShimRegion<BIG> {
             );
             said = Some(b);
         }
-        arena_note(1, len);
         // Count of refills, plus the biggest single layout that forced one --
         // which separates one doubling buffer from many live objects.
         HEAP_REFILLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3557,6 +3565,7 @@ unsafe impl<const BIG: bool> talc::source::Source for ShimRegion<BIG> {
             }
             return Err(());
         };
+        arena_note(1, len);
         let base = base as *mut u8;
         if let Some(b) = said {
             // SAFETY: as above.
@@ -5043,8 +5052,8 @@ fn slot_span_locked(i: usize) -> Option<u64> {
     if base != 0 {
         return Some(base);
     }
-    arena_note(2, (slots::STACK + slots::TLS) as u64);
     let base = arena_take((slots::STACK + slots::TLS) as u64)?;
+    arena_note(2, (slots::STACK + slots::TLS) as u64);
     SLOT_BASE[i].store(base, Ordering::Release);
     // SAFETY: as in `gex_worker_init`; the claims name the span once, when it
     // is taken.
