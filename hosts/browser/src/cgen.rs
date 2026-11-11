@@ -311,6 +311,13 @@ pub(crate) fn in_install_window(page: u64) -> bool {
 }
 /// The pages installed units cover, hashed as built (`on_retire`).
 static UNIT_PAGES: Mutex<Option<std::collections::HashMap<u64, u64>>> = Mutex::new(None);
+
+/// Of `pages`, those a published unit has code on.
+pub(crate) fn unit_pages_of(pages: &[u64]) -> std::collections::HashSet<u64> {
+    let g = lock(&UNIT_PAGES);
+    let Some(m) = g.as_ref() else { return Default::default() };
+    pages.iter().copied().filter(|p| m.contains_key(p)).collect()
+}
 /// The process's function table, host side (`gex_kernel::ftab`): one for
 /// every Worker, each of which keeps its own `WebAssembly.Table` in step.
 static FTAB: Mutex<Option<FuncMap>> = Mutex::new(None);

@@ -4091,6 +4091,13 @@ struct Jit {
     /// predate the change, so it is never served here again; see
     /// `gex_jit_installed` for the pending side.
     pub(crate) retired_pages: std::collections::HashSet<u64>,
+    /// Pages (keys, either mode) retired since whose every translation was
+    /// made while the page was writable and executable, so each block of it
+    /// checks its bytes (`Block::guard`): made writable again while it
+    /// stays executable, such a page keeps its translations
+    /// (`MapLog::writable_code`, [`keep_guarded`]). Any other translation
+    /// on a page, or a stored module served there, takes it out.
+    guarded_pages: std::collections::HashSet<u64>,
     /// The page each directory entry this process published names (by the
     /// entry: table and first slot), so a module's blocks can be told which
     /// pages they are on.
@@ -11629,6 +11636,7 @@ fn fresh_jit(meta: &gex_xlate::Metadata) -> Jit {
         own_bases: Default::default(),
         stale_again: Default::default(),
         retired_pages: Default::default(),
+        guarded_pages: Default::default(),
         base_pages: Default::default(),
         dense_on_page: Default::default(),
         dense_live: Default::default(),
@@ -17683,6 +17691,7 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             page: u64,
             started: u64,
             epoch: (u32, u32),
+            volatile: Vec<(u64, u64)>,
         },
     }
     let pre = with_px(|px| with_jit_only(|j| {
@@ -17924,6 +17933,11 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
                     let mut kept: Vec<Vec<(u64, u32)>> = Vec::with_capacity(ready.len());
                     for (id, s, d, _) in &ready {
                         note_installed(j, *id, d.iter().map(|(p, _)| *p));
+                        // (built elsewhere: whether its blocks check their
+                        // bytes is not known here)
+                        for (p, _) in d.iter() {
+                            j.guarded_pages.remove(p);
+                        }
                         slots = slots.max(*s);
                         // Every page they cover, before the install: install
                         // asks the shim which slot each block belongs in, and
@@ -18078,13 +18092,16 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             }
         }
         let started = now_ns();
+        // The writable and executable ranges this translation guards.
+        let mut volatile: Vec<(u64, u64)> = Vec::new();
         // x86-64: what the page table's identity hooks answer from, as of now,
         // and which pages are a JIT's (writable and executable, or written
         // through another view), so their blocks carry a self-modifying-code
         // guard. See `Block::guard`, `MemoryMap::volatile_code`.
         if gex_abi::X86 {
         refresh_ident_snapshot(px);
-        gex_xlate::set_volatile_ranges(px.mm.lock().volatile_code());
+        volatile = px.mm.lock().volatile_code();
+        gex_xlate::set_volatile_ranges(volatile.clone());
         }
         phase(11);
         // The page table moves out and back: cloning it (a BTreeMap of every
@@ -18103,13 +18120,14 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
             page,
             started,
             epoch,
+            volatile,
         };
         jitout::OUT.store(jit_me(), std::sync::atomic::Ordering::Release);
         go
     }));
     let translated = match pre {
         MissPre::Done(t) => t,
-        MissPre::Go { exec, mut known, table, intr, page, started, epoch } => {
+        MissPre::Go { exec, mut known, table, intr, page, started, epoch, volatile } => {
     // A provider's address counts as known: a miss there is bridged again
     // (`cgen::provider_serves`), its bytes may be a `ud2` stub; in the other
     // mode, a function of that mode bound there (`cgen::alt_serves`).
@@ -18312,6 +18330,14 @@ fn dispatch_miss(_ctx: i32, pc: i64) -> i32 {
         // again forever. Reconcile it below, after the unit is installed.
         let fault_base = unit.covered.iter().find(|(p, _)| *p == page).map(|(_, b)| *b);
         note_live(&unit.covered);
+        // A page this unit has code on that was not writable and executable
+        // as it was lifted: its blocks check nothing of their bytes.
+        for &(p, _) in &unit.covered {
+            let at = (p & !gex_abi::ALT_PAGE) * gex_abi::DISPATCH_PAGE;
+            if !volatile.iter().any(|&(s, e)| s <= at && at + gex_abi::DISPATCH_PAGE <= e) {
+                j.guarded_pages.remove(&p);
+            }
+        }
         // The entries the install publishes: the pages this unit numbered,
         // and every other page it covers whose directory entry this process
         // never wrote. A forked child is that case: its page table keeps the
@@ -18734,7 +18760,7 @@ fn retire_unmapped_code_in(h: &mut Host) {
     let mm = &h.kernel.mem;
     with_jit_only(|_| {
         let (retired, recheck, _) = take_logged(mm, false);
-        retire_noted(mm, &retired, &recheck);
+        retire_noted(mm, retired, &recheck);
     });
 }
 
@@ -18752,15 +18778,64 @@ fn retire_unmapped_code_in(h: &mut Host) {
 pub(crate) fn take_logged(
     mm: &gex_kernel::mem::Mm,
     mapped: bool,
-) -> (Vec<(u64, u64)>, Vec<(u64, u64)>, Vec<gex_kernel::CodeMap>) {
+) -> (Logged, Vec<(u64, u64)>, Vec<gex_kernel::CodeMap>) {
     assert!(jit_holds(), "gex: the map's log drained without the JIT lock");
     let mut g = mm.lock();
     let log = &mut g.log;
     (
-        std::mem::take(&mut log.retired_code),
+        Logged { retired: std::mem::take(&mut log.retired_code), writable: std::mem::take(&mut log.writable_code) },
         std::mem::take(&mut log.recheck_code),
         if mapped { std::mem::take(&mut log.new_code) } else { Vec::new() },
     )
+}
+
+/// Code the map's log says was retired ([`take_logged`]): all of it, and
+/// of it what was only made writable while it stays executable.
+#[derive(Default)]
+pub(crate) struct Logged {
+    retired: Vec<(u64, u64)>,
+    writable: Vec<(u64, u64)>,
+}
+
+/// Of `retired`, what to retire: less the pages only made writable
+/// (`writable`) whose every translation checks its bytes
+/// (`Jit::guarded_pages`), and where no unit has code. A loader that makes
+/// its `.text` writable around each patch (MinGW's pseudo-relocations,
+/// one `VirtualProtect` of the whole section a patch) otherwise retires
+/// the section, the code doing the patching with it, once a patch.
+/// x86 only: AArch64's blocks carry no guard.
+fn keep_guarded(j: &Jit, retired: &[(u64, u64)], writable: &[(u64, u64)], units: &std::collections::HashSet<u64>) -> Vec<(u64, u64)> {
+    if writable.is_empty() || !gex_abi::X86 || crate::fjit::on() {
+        return retired.to_vec();
+    }
+    let kept = |page: u64| {
+        let at = page * gex_abi::DISPATCH_PAGE;
+        writable.iter().any(|&(s, e)| s <= at && at + gex_abi::DISPATCH_PAGE <= e)
+            && !units.contains(&page)
+            && !units.contains(&(page | gex_abi::ALT_PAGE))
+            && j.guarded_pages.contains(&page)
+            && j.guarded_pages.contains(&(page | gex_abi::ALT_PAGE))
+    };
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    for &(start, end) in retired {
+        if end <= start {
+            continue;
+        }
+        let mut lo = start;
+        for page in start / gex_abi::DISPATCH_PAGE..=(end - 1) / gex_abi::DISPATCH_PAGE {
+            let (ps, pe) = ((page * gex_abi::DISPATCH_PAGE).max(start), ((page + 1) * gex_abi::DISPATCH_PAGE).min(end));
+            if kept(page) {
+                if lo < ps {
+                    out.push((lo, ps));
+                }
+                lo = pe;
+            }
+        }
+        if lo < end {
+            out.push((lo, end));
+        }
+    }
+    out
 }
 
 /// What a mapping call made without the kernel lock (`free_syscall`) noted
@@ -18773,27 +18848,45 @@ fn map_drain() -> Vec<gex_kernel::CodeMap> {
     let mm = home.mm();
     with_jit_only(|_| {
         let (retired, recheck, mapped) = take_logged(mm, true);
-        retire_noted(mm, &retired, &recheck);
+        retire_noted(mm, retired, &recheck);
         mapped
     })
 }
 
 /// Retire `retired` (code unmapped or made writable) and compare `recheck`
 /// (made executable again), whoever noted them.
-fn retire_noted(mm: &gex_kernel::mem::Mm, retired: &[(u64, u64)], recheck: &[(u64, u64)]) {
+fn retire_noted(mm: &gex_kernel::mem::Mm, logged: Logged, recheck: &[(u64, u64)]) {
+    let retired = &logged.retired[..];
     if !retired.is_empty() {
         crate::cgen::on_retire(retired, &gone_code(mm, retired));
         crate::fjit::on_retire(retired);
         let why = gex_kernel::take_retire_why();
+        // The pages units have code on, asked before the JIT lock is taken.
+        let units = if logged.writable.is_empty() {
+            Default::default()
+        } else {
+            let pages: Vec<u64> = logged
+                .writable
+                .iter()
+                .flat_map(|&(s, e)| (s / gex_abi::DISPATCH_PAGE..e.div_ceil(gex_abi::DISPATCH_PAGE)).flat_map(|p| [p, p | gex_abi::ALT_PAGE]))
+                .collect();
+            crate::cgen::unit_pages_of(&pages)
+        };
         with_jit_only(|j| {
+            let retire = keep_guarded(j, retired, &logged.writable, &units);
+            let retiring = |page: u64| {
+                let at = page * gex_abi::DISPATCH_PAGE;
+                retire.iter().any(|&(s, e)| at < e && at + gex_abi::DISPATCH_PAGE > s)
+            };
             for w in &why {
                 for page in w.start / gex_abi::DISPATCH_PAGE..w.end.div_ceil(gex_abi::DISPATCH_PAGE) {
-                    if page < gex_abi::dispatch_max_pages() && j.page_table.lookup(page).is_some() {
+                    // Pages kept (`keep_guarded`) are not counted.
+                    if page < gex_abi::dispatch_max_pages() && j.page_table.lookup(page).is_some() && retiring(page) {
                         note_page_retired(Some(mm), page, w);
                     }
                 }
             }
-            retire_code(j, retired)
+            retire_code_keeping(j, retired, &retire)
         });
     }
     // Made executable again: the units' pages are compared, nothing is
@@ -18875,6 +18968,13 @@ pub(crate) fn gone_code(mm: &gex_kernel::mem::Mm, ranges: &[(u64, u64)]) -> Vec<
 /// Forget every translation in `ranges` (see `retire_unmapped_code`). The
 /// old slots are left behind, unreachable.
 pub(crate) fn retire_code(j: &mut Jit, ranges: &[(u64, u64)]) {
+    retire_code_keeping(j, ranges, ranges)
+}
+
+/// [`retire_code`] of `retire`, the part of `ranges` that is retired here;
+/// a translation in flight retires all of `ranges` once its unit is queued
+/// (it may have lifted the code before the change, unguarded).
+fn retire_code_keeping(j: &mut Jit, ranges: &[(u64, u64)], retire: &[(u64, u64)]) {
     use std::sync::atomic::Ordering;
     // Under the JIT lock, so it waits for a translation in flight; and a
     // translation that may have read the old code retires these ranges again
@@ -18891,7 +18991,7 @@ pub(crate) fn retire_code(j: &mut Jit, ranges: &[(u64, u64)]) {
         }
         drop(log);
     }
-    retire_ranges(j, ranges);
+    retire_ranges(j, retire);
 }
 
 /// `gex_test_serve_unmerged(1)` (GEX_TEST_SERVE_UNMERGED): modules served
@@ -18941,6 +19041,9 @@ fn retire_ranges(j: &mut Jit, ranges: &[(u64, u64)]) {
             pwatch_say(page, || format!("retired [{start:#x}, {end:#x})"));
             j.page_table.forget(page);
             j.retired_pages.insert(page);
+            // Nothing of it translated now: what is next is the next lift's.
+            j.guarded_pages.insert(page);
+            j.guarded_pages.insert(page | gex_abi::ALT_PAGE);
             forget_installed_on(j, page);
             let at = gex_abi::dispatch_dir() + page * 4;
             // SAFETY: the directory is in the shared memory, four-byte

@@ -491,6 +491,13 @@ pub struct MapLog {
     /// simply runs the wrong function. A long-running X server does exactly
     /// this every time its last client disconnects and it resets.
     pub retired_code: Vec<(u64, u64)>,
+    /// Of [`Self::retired_code`], the ranges retired by being made writable
+    /// while they stay executable (`mprotect` to read+write+execute: a
+    /// loader patching its own `.text`, a hot patch). A host whose
+    /// translations of code that is writable and executable check their
+    /// bytes may keep those translations there; every other host treats
+    /// these as retired, as they are.
+    pub writable_code: Vec<(u64, u64)>,
     /// Ranges made executable again by `mprotect` (read+execute, no write):
     /// the function tier compares its units' pages there (a loader that lifted
     /// `.text` to fill an import table and put it back, `cgen::on_retire`).

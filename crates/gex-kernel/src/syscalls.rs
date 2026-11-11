@@ -4489,6 +4489,12 @@ impl MapIo<'_> {
         // detour), which x86 needs no cache flush to see.
         if (a[2] as u32) & crate::mem::prot::EXEC == 0 || (a[2] as u32) & crate::mem::prot::WRITE != 0 {
             self.retire_code_why(a[0], a[1], "mprotect", a[2] as u32);
+            if (a[2] as u32) & crate::mem::prot::EXEC != 0 {
+                let (start, end) = (crate::mem::page_align_down(a[0]), crate::mem::page_align_up(a[0].saturating_add(a[1])));
+                if end > start {
+                    self.mem.lock().log.writable_code.push((start, end));
+                }
+            }
         }
         let mut mm = self.mem.lock();
         let r = mm.protect(a[0], a[1], (a[2] & 0x7) as u32).map(|_| 0);

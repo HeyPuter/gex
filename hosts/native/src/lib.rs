@@ -4762,7 +4762,12 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
             // below: a `dlclose`+`dlopen` reuses addresses, and retiring after
             // would throw away the fresh translation.
             let retired: Vec<(u64, u64)> = caller.data_mut().with_kernel(|k| {
-                let r = std::mem::take(&mut k.mem.lock().log.retired_code);
+                let mut mm = k.mem.lock();
+                // (this host keeps no translation of writable code: those
+                // ranges are retired with the rest)
+                mm.log.writable_code.clear();
+                let r = std::mem::take(&mut mm.log.retired_code);
+                drop(mm);
                 if !r.is_empty() {
                     RETIRING.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
