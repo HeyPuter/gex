@@ -51,7 +51,7 @@ export default async function (t) {
     code = code.replace(a, b);
   }
   const base = t.baseUrl === '/' ? null : t.baseUrl;
-  code = code.replace(/from '(@gex\/runtime[^']*)'/g, (m, spec) => {
+  code = code.replace(/from '(@gexemu\/runtime[^']*)'/g, (m, spec) => {
     const src = MODULES[spec];
     if (!src) throw new Error(`the README imports ${spec}, which this test does not map`);
     return `from ${JSON.stringify(base ? new URL(BUILT[src], new URL(base, location.href)).href : new URL(`../../page/runtime/src/${src}`, HERE).href)}`;
