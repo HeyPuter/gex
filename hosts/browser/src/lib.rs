@@ -3378,22 +3378,28 @@ fn wine32_note_reach(to: u64, why: &str, start: u64, end: u64) {
     // Unguarded units fold only constant KUSER_SHARED_DATA addresses (cgen):
     // a computed one into Windows' old page is caught by the engine's bounds
     // check only while the memory ends below it. Past it, such a read would
-    // succeed with whatever is there, so say so, once, by default. The
-    // heap's own reach (`HEAP_REACH`, recorded where nothing may allocate)
-    // is checked here too, at the next mapping.
-    static KUSER_SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    // succeed with whatever is there. Translated code checks such accesses
+    // itself (`BRK_KUSER_UNFOLDED`) wherever the memory ends, so the reach
+    // matters only once a program's unguarded unit is published: said by
+    // default then, once, and as debug output otherwise. The heap's own
+    // reach (`HEAP_REACH`, recorded where nothing may allocate) is checked
+    // here too, at the next mapping.
+    static KUSER_SAID: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
     let reach = to.max(HEAP_REACH.load(std::sync::atomic::Ordering::Relaxed));
-    if winspace::wine32_compact()
-        && gex_abi::kuser_fold()
-        && reach > gex_abi::KUSER_WINDOWS
-        && !KUSER_SAID.swap(true, std::sync::atomic::Ordering::Relaxed)
-    {
-        warn_line(&format!(
-            "gex: CRITICAL: wine32 pid {}: memory reached the old KUSER page ({:#x}, now {:#x}, for {why}); unguarded units may read it\n",
-            my_pid(),
-            gex_abi::KUSER_WINDOWS,
-            reach,
-        ));
+    let said = KUSER_SAID.load(std::sync::atomic::Ordering::Relaxed);
+    if winspace::wine32_compact() && gex_abi::kuser_fold() && reach > gex_abi::KUSER_WINDOWS && said < 2 {
+        let exposed = crate::cgen::unguarded_image_unit();
+        if exposed || said == 0 {
+            KUSER_SAID.store(if exposed { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+            let line = format!(
+                "gex: wine32 pid {}: memory reached the old KUSER page ({:#x}, now {:#x}, for {why}){}\n",
+                my_pid(),
+                gex_abi::KUSER_WINDOWS,
+                reach,
+                if exposed { "; an unguarded unit's computed read there would not fault" } else { "" },
+            );
+            if exposed { warn_line(&line) } else { trace_line(&line) }
+        }
     }
     if !winspace::wine32_compact() || to <= SAID.load(std::sync::atomic::Ordering::Relaxed) {
         return;

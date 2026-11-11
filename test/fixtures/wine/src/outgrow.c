@@ -5,7 +5,11 @@
  *   outgrow crash      no room: says "outgrow short", then raises an
  *                      access violation no handler takes (gex maps no
  *                      guard at address 0 unless asked to)
- *   outgrow fallback   no room: reserves 64 MiB instead and exits 0
+ *   outgrow fallback   no room: reserves 64 MiB blocks instead until one
+ *                      is refused, says "outgrow fallback ok", then
+ *                      reserves 64 KiB at 0x7ff00000, just below Windows'
+ *                      old KUSER_SHARED_DATA page, and says "outgrow
+ *                      reached 2g" when it got it; exits 0
  *   outgrow twice M    runs `outgrow M` twice, one after the other
  *                      (CreateProcess each), and says how each ended
  *   outgrow each M X.. the same for each program X (a copy of this one),
@@ -68,7 +72,19 @@ int main(int argc, char **argv) {
         fflush(stdout);
         RaiseException(EXCEPTION_ACCESS_VIOLATION, EXCEPTION_NONCONTINUABLE, 0, NULL);
     }
-    p = VirtualAlloc(NULL, 64 << 20, MEM_RESERVE, PAGE_NOACCESS);
-    printf("outgrow fallback %s\n", p ? "ok" : "failed");
+    {
+        ULONG_PTR top = 0;
+        int n = 0;
+
+        while ((p = VirtualAlloc(NULL, 64 << 20, MEM_RESERVE, PAGE_NOACCESS))) {
+            if ((ULONG_PTR)p + (64 << 20) > top) top = (ULONG_PTR)p + (64 << 20);
+            n++;
+        }
+        printf("outgrow fallback %s\n", n ? "ok" : "failed");
+        /* a block just below the old KUSER page, at its address: the
+         * memory then reaches past that page */
+        if (VirtualAlloc((void *)0x7ff00000, 0x10000, MEM_RESERVE, PAGE_NOACCESS)) top = 0x7ff10000;
+        if (top > 0x7f000000) printf("outgrow reached 2g\n");
+    }
     return 0;
 }

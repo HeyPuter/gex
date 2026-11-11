@@ -24,6 +24,9 @@ const SRC = fileURLToPath(new URL('../fixtures/wine/src/outgrow.c', import.meta.
 const SAID = /outgrow\.exe needs 64-bit memory \(a reservation of 0xe0000000 bytes did not fit\); it gets it from its next start/;
 const NOTICE = /needs 64-bit memory; it will get it the next time it starts/;
 const lines = (out) => out.replace(/\r/g, '').split('\n').filter((l) => l.startsWith('outgrow ')).join('\n');
+// (where the fallback's blocks ended is checked on the page only)
+const fell = (out) => lines(out).split('\n').filter((l) => l !== 'outgrow reached 2g').join('\n');
+const KUSER_LINE = /memory reached the old KUSER page/;
 // The host file's user.gex.mem64, or null.
 const recorded = (p) => {
   const r = spawnSync('python3', ['-c', 'import os, sys\ntry: print(os.getxattr(sys.argv[1], "user.gex.mem64").decode())\nexcept OSError: print("")', p], { encoding: 'utf8' });
@@ -47,7 +50,7 @@ export default async function (t) {
   // memory64 twin is the page's, so the record is what is checked)
   t.eq('native: its .exe is recorded for a 64-bit memory', recorded(join(keep, 'outgrow.exe')), '1', w.detail(c));
   const f = await w.native([dos(join(keep, 'fallback.exe')), 'twice', 'fallback'], { name: 'native-fallback' });
-  t.eq('native: one that falls back and exits 0 keeps the lowered memory', lines(f.out),
+  t.eq('native: one that falls back and exits 0 keeps the lowered memory', fell(f.out),
     'outgrow fallback ok\noutgrow child exit 00000000\noutgrow fallback ok\noutgrow child exit 00000000', w.detail(f));
   t.check('native: and is not recorded', !NOTICE.test(f.out) && recorded(join(keep, 'fallback.exe')) === null, w.detail(f));
 
@@ -70,6 +73,12 @@ export default async function (t) {
     Array(N).fill('outgrow short\noutgrow child exit c0000005\noutgrow big high\noutgrow child exit 00000000').join('\n'), w.detail(pl));
   const pf = await w.page(['/t/outgrow.exe', 'twice', 'fallback'], { files: { '/t/outgrow.exe': exe }, name: 'page-fallback', timeout: 600000 });
   t.eq('page: one that falls back and exits 0 is not recorded and keeps the lowered memory', lines(pf.out),
-    'outgrow fallback ok\noutgrow child exit 00000000\noutgrow fallback ok\noutgrow child exit 00000000', w.detail(pf));
+    'outgrow fallback ok\noutgrow reached 2g\noutgrow child exit 00000000\noutgrow fallback ok\noutgrow reached 2g\noutgrow child exit 00000000', w.detail(pf));
+  // its last block takes the memory past Windows' old KUSER page, which matters only to an
+  // unguarded unit's computed reads: no unit here, so nothing is said by
+  // default (debug output only)
+  t.check('page: reaching the old KUSER page without units says nothing by default', !KUSER_LINE.test(pf.out + pf.err), w.detail(pf));
+  const pd = await w.page(['/t/outgrow.exe', 'fallback'], { files: { '/t/outgrow.exe': exe }, env: { GEX_LOG: 'debug' }, name: 'page-fallback-debug', timeout: 600000 });
+  t.check('page: and says it as debug output', KUSER_LINE.test(pd.out + pd.err), w.detail(pd));
   w.clean();
 }

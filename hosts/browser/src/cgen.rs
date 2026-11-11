@@ -277,6 +277,18 @@ fn known(base: u64, path: &str) -> Option<(String, String)> {
 static UNITS: Mutex<Vec<Unit>> = Mutex::new(Vec::new());
 /// Published units, in publish order: what every Worker installs.
 static PUBLISHED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+/// Whether an unguarded unit of a program's image is published: code whose
+/// computed accesses are checked by the memory's bounds alone. The
+/// trampolines' unit (named in brackets) reads KUSER_SHARED_DATA by
+/// constant only. An atomic, as the mapping paths that ask may run under
+/// the units' locks.
+static UNGUARDED_IMAGE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn unguarded_image_unit() -> bool {
+    UNGUARDED_IMAGE.load(Ordering::Relaxed)
+}
+
 // Claims ([`U_CLAIMED`]): `gex_cgen_wanted` hands the oldest wanted unit to
 // every Worker that asks until it is published, so two threads of a process
 // can load and publish the same unit; the second publish found every page
@@ -1582,6 +1594,9 @@ pub extern "C" fn gex_cgen_publish(u: u32, entries: u32, n: u32) -> i32 {
         x.regs = regs;
         x.dirs = dirs;
         x.slots = nslots;
+        if gex_cgen::image::unguarded() && !x.path.starts_with('[') {
+            UNGUARDED_IMAGE.store(true, Ordering::Relaxed);
+        }
         let mut pages = lock(&UNIT_PAGES);
         let map = pages.get_or_insert_with(Default::default);
         let mut mem = crate::guest();
