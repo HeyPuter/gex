@@ -17,6 +17,9 @@
 // - bigdata: 24 MiB of zeroed data, more than the page's PE data window
 //   for builtins' data exports holds: its ends written and read, and the
 //   program's module;
+// - fontset: IDWriteFontSet::GetMatchingFonts by family, weight, stretch
+//   and style, on the system set (Tahoma bold first when asked for bold)
+//   and on a set of a font file in memory;
 // - missimp: an import no DLL exports, bound to a stub (listed at the
 //   link): the program runs, and a call of it ends the process as Wine's
 //   stubs do;

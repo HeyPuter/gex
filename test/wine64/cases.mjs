@@ -218,6 +218,7 @@ export async function gexccWin(t, w, o = {}, pre = '', only = null) {
     want: /cbfault: sending\ncbfault: veh c0000005\n([^\n]*\n)*cbfault: returned 0, veh [0-9]+/ });
   await one('ptval', join(F, 'ptval.c'), ['-O1', '-mwindows'], { nullDriver: true });
   await one('selfaddr', join(F, 'selfaddr.c'), ['-O1'], { want: /selfaddr: data 1 bss 1 code 1\nselfaddr ok/ });
+  await one('fontset', join(F, 'fontset.c'), ['-O1', '-ldwrite'], { want: /fontset: system bold 700 regular 400\nfontset: in memory 400\nfontset ok/ });
   if (want('missimp')) {
     // an import no DLL exports: a stub, listed at the link; the program
     // runs, and a call of it ends the process as Wine's stubs do
@@ -256,7 +257,7 @@ export async function gexccWin(t, w, o = {}, pre = '', only = null) {
     writeFileSync(src, '#include <windows.h>\n#include <stdio.h>\nstatic char big[24 << 20];\nint lit[4] = {1, 2, 3, 4};\n' +
       'static int of(const void *p) { HMODULE h = 0; return GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | ' +
       'GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, p, &h) && h == GetModuleHandleW(NULL); }\n' +
-      'int main(void) { big[0] = 7; big[sizeof big - 1] = 9; int ok = big[0] == 7 && big[sizeof big - 1] == 9 && lit[3] == 4;\n' +
+      'int main(int argc, char **argv) { big[0] = 7; big[sizeof big - 1] = 9; int ok = big[0] == 7 && big[sizeof big - 1] == 9 && lit[3] == 4;\n' +
       '  printf("bigdata: ends %d module %d %d\\n", ok, of(big), of(big + sizeof big - 1)); return 0; }\n');
     await one('bigdata', src, ['-O1'], { want: /bigdata: ends 1 module 1 1/ });
   }
