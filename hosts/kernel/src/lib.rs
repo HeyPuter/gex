@@ -1738,6 +1738,9 @@ pub extern "C" fn k_exit(pid: i32, status: i32) {
     note_kill(pid, procs().ppid(pid), gex_kernel::signal::sig::SIGCHLD);
     // Its record locks, however it ended.
     locks().release_pid(pid, None);
+    // What it wrote is kept before its parent hears it ended. A failure is
+    // the write-back's to say: it tries again and reports it.
+    let _ = gex_kernel::vfs::tmpfs::persist::exited();
     procs().exit_code(pid, status);
 }
 

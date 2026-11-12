@@ -341,7 +341,7 @@ pub static CHECKPOINTS: AtomicU64 = AtomicU64::new(0);
 /// Commits asked for (by a sync, by the tick), paths the walks looked at,
 /// records they made, and the metadata bytes written (checkpoints among
 /// them): [`stats`].
-pub static ST: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+pub static ST: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 const S_SYNC: usize = 0;
 const S_TICK: usize = 1;
 const S_NODES: usize = 2;
@@ -349,11 +349,12 @@ const S_RECS: usize = 3;
 const S_BYTES: usize = 4;
 const S_CK_BYTES: usize = 5;
 const S_EMPTY: usize = 6;
+const S_EXIT: usize = 7;
 
 /// gens, records put, paths dropped, checkpoints; commits by a sync, by
 /// the tick; paths walked, records walked; metadata bytes, checkpoint
-/// bytes; commits with nothing changed.
-pub fn stats() -> [u64; 11] {
+/// bytes; commits with nothing changed; commits at a process's exit.
+pub fn stats() -> [u64; 12] {
     let l = |a: &AtomicU64| a.load(Ordering::Relaxed);
     [
         l(&GENS),
@@ -367,6 +368,7 @@ pub fn stats() -> [u64; 11] {
         l(&ST[S_BYTES]),
         l(&ST[S_CK_BYTES]),
         l(&ST[S_EMPTY]),
+        l(&ST[S_EXIT]),
     ]
 }
 
@@ -995,6 +997,22 @@ pub fn tick(age: u32) -> Result<u32, Errno> {
     Ok(1)
 }
 
+/// A process has ended: when the tree changed or a block is dirty since the
+/// last generation, one is written now, before its parent hears of the
+/// exit, so what a program wrote is kept once it has ended (an installer's
+/// files, before the page can be left or reloaded), not a write-back's age
+/// later. 1 when one was written, 0 when nothing was waiting.
+pub fn exited() -> Result<u32, Errno> {
+    let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(st) = g.as_mut() else { return Ok(0) };
+    if META.load(Ordering::Relaxed) == st.seen && !blocks::aged(0) {
+        return Ok(0);
+    }
+    ST[S_EXIT].fetch_add(1, Ordering::Relaxed);
+    st.commit()?;
+    Ok(1)
+}
+
 /// Whether the root is kept.
 pub fn on() -> bool {
     STATE.lock().unwrap().is_some()
@@ -1145,6 +1163,33 @@ mod tests {
         check1(&fs);
         assert!(read(&fs, "home/after").is_none());
         reset();
+    }
+
+    /// A process's exit writes a generation when anything is waiting, so an
+    /// installer's files are kept once it has ended with no write-back tick
+    /// or sync after it; with nothing waiting it writes none.
+    #[test]
+    #[ignore]
+    fn an_exit_keeps_what_was_written() {
+        STORE_FILE.lock().unwrap().clear();
+        let fs = boot();
+        start(&fs, vec![]);
+        let gen = || STATE.lock().unwrap().as_ref().unwrap().sb.gen;
+        let g0 = gen();
+        assert_eq!(exited().unwrap(), 0, "nothing written: no generation");
+        assert_eq!(gen(), g0);
+        fs.mkdir("prog", 0o755).unwrap();
+        write(&fs, "prog/app.exe", &big(60000, 3));
+        write(&fs, "prog/small.dll", b"dll");
+        assert_eq!(exited().unwrap(), 1, "an install's files: a generation");
+        assert_eq!(gen(), g0 + 1);
+        assert_eq!(exited().unwrap(), 0, "and none again for nothing new");
+
+        // The next boot, with no tick or sync since the exit.
+        let fs = boot();
+        assert_eq!(start(&fs, vec![]), Found::Restored);
+        assert_eq!(read(&fs, "prog/app.exe").unwrap(), big(60000, 3));
+        assert_eq!(read(&fs, "prog/small.dll").unwrap(), b"dll");
     }
 
     /// Extended attributes set on a file of the sources (a program's
