@@ -343,11 +343,12 @@ export async function guestNative(t, w, o = {}, pre = '', only = null) {
       t.check(`${pre}${n}: build`, false, String(e.message));
       continue;
     }
-    // cbthrow hangs today on two jumps out in a row with no native entry
-    // between: gexrt keeps its call-out records on the stack just above the
-    // callee's frame, which the guest reuses once it has jumped above them
-    // (less than NATIVE_UNWOUND), and the next entry reads them.
-    const known = n === 'cbthrow' ? { known: 'gexrt call-out records on the guest stack: Wine core', timeout: Math.min(o.timeout ?? 300000, 300000) } : {};
+    // On the page cbthrow ends in a host stack overflow: a jump out that
+    // lands less than NATIVE_UNWOUND above its call-out's return pad leaves
+    // that call-out running (gex does not abandon it), one more host level
+    // per jump, and a Worker's stack holds fewer of them than the 4000 jumps
+    // here (natively 20000 fit, 40000 do not).
+    const known = n === 'cbthrow' && o.page ? { known: 'call-outs left within NATIVE_UNWOUND nest on the host: gex core' } : {};
     await w.nt({ want: allOk, ...o, ...known, name: `${pre}${n}`, exe, extra: [dll, `${dll}.wasm`] });
   }
 }
