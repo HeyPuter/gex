@@ -193,6 +193,8 @@ function progressMeter(state, onProgress) {
     elapsed: 0,
     error: null,
     fetch: null,
+    // the rest bundles' background download, once it starts: compressed bytes of this visit's, `complete` at its end
+    rest: null,
     boot: { units: { done: 0, total: 0 }, programs: { done: 0, total: 0 }, program: null, image: null },
     log: [],
   };
@@ -365,6 +367,12 @@ function progressMeter(state, onProgress) {
     },
     /** `f` once the start-up is over. */
     whenReady(f) { if (p.phase === 'ready') f(); else onReady.push(f); },
+    /** The rest bundles' background download: `done` of `total` compressed bytes, `complete` at its end. */
+    rest(done, total, complete = false) {
+      p.rest = { done, total, complete };
+      if (complete) log('phase', `The rest of the files are here (${(total / 1e6).toFixed(1)} MB downloaded)`);
+      emit();
+    },
     /** The run is over: 'exited' or 'failed'. */
     end(name, error = null) {
       if (p.phase === 'failed' || p.phase === 'exited') return;
@@ -822,7 +830,11 @@ async function begin(opts, base, at, state, meter, lets) {
       const ready = await new Promise((r) => {
         w.onmessage = ({ data: m }) => {
           if (m.kind === 'ready') r(m);
-          else if (m.kind === 'ahead') say(`[app] rest bundle fetched ahead: ${m.frames} frames, ${(m.bytes / 1e6).toFixed(1)} MB\n`);
+          else if (m.kind === 'rest') meter.rest(m.done, m.total);
+          else if (m.kind === 'ahead') {
+            meter.rest(meter.p.rest?.done ?? 0, meter.p.rest?.total ?? 0, true);
+            say(`[app] rest bundle fetched ahead: ${m.frames} frames, ${(m.bytes / 1e6).toFixed(1)} MB\n`);
+          }
           else if (m.kind === 'bytes') {
             lc.net += m.net;
             lc.cached += m.cached;
@@ -837,12 +849,13 @@ async function begin(opts, base, at, state, meter, lets) {
       if (ready.ok) {
         lc.on = true;
         lazyCache = { ctl };
-        // The rest bundles' frames fetched in the background once the start-up is over (none while the page is
-        // hidden): the reads after it find them in the owner's store.
+        // The rest bundles downloaded in the background as soon as the title files are in (the pieces, the
+        // streamed archive), not after the start-up: the program does not wait for them, and the reads after
+        // find their frames in the owner's store (none while the page is hidden).
         const restBundles = [...new Set(lazy.map(([, , url]) => String(url)).filter((u) => u.includes('#')).map((u) => u.slice(0, u.lastIndexOf('#'))))];
         if (restBundles.length && sw.restahead !== '0') {
           const paused = () => w.postMessage({ kind: 'ahead', paused: document.visibilityState === 'hidden' });
-          meter.whenReady(() => {
+          Promise.allSettled([pieceBufs, streamed?.done]).then(() => {
             w.postMessage({ kind: 'ahead', bundles: restBundles, paused: document.visibilityState === 'hidden' });
             document.addEventListener('visibilitychange', paused);
           });
