@@ -1075,8 +1075,14 @@ fn install_module(
     let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
     // (`wine_pe` is the core of the process's own mode; the other mode's
     // core is with the modules of their own)
+    // A program's module with no core beside it (a gexcc-win program's)
+    // was installed without one, before ntdll's skeleton mapped: the
+    // core installed since takes its place and it stays with the modules
+    // of their own, for image_of and its later mappings to find.
     if core.is_none() && !alt {
-        s.wine_pe = Some(wp.clone());
+        if let Some(prev) = s.wine_pe.replace(wp.clone()) {
+            s.wine_pe_split.push(prev);
+        }
     } else {
         s.wine_pe_split.push(wp.clone());
     }

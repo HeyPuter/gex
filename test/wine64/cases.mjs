@@ -217,6 +217,7 @@ export async function gexccWin(t, w, o = {}, pre = '', only = null) {
   await one('cbfault', join(F, 'cbfault.c'), ['-O1'], { nullDriver: true,
     want: /cbfault: sending\ncbfault: veh c0000005\n([^\n]*\n)*cbfault: returned 0, veh [0-9]+/ });
   await one('ptval', join(F, 'ptval.c'), ['-O1', '-mwindows'], { nullDriver: true });
+  await one('selfaddr', join(F, 'selfaddr.c'), ['-O1'], { want: /selfaddr: data 1 bss 1 code 1\nselfaddr ok/ });
   if (want('missimp')) {
     // an import no DLL exports: a stub, listed at the link; the program
     // runs, and a call of it ends the process as Wine's stubs do

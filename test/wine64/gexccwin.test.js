@@ -12,6 +12,8 @@
 //   access violation its vectored handler sees, and the process goes on;
 // - ptval: user32 calls taking a POINT by value, directly and through
 //   GetProcAddress's pointers;
+// - selfaddr: GetModuleHandleExW(FROM_ADDRESS) on the program's own data,
+//   zeroed data and function is the program's module;
 // - missimp: an import no DLL exports, bound to a stub (listed at the
 //   link): the program runs, and a call of it ends the process as Wine's
 //   stubs do;
