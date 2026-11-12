@@ -522,9 +522,10 @@ function session(t, { kind, distSrc, pfxSrc, monoSrc = null, nativeSrc = null, w
         // (the runtime's own lines, which a GEX_LOG past `off` says on stdout, out)
         r.stdout = r.out.replace(/\r/g, '').split('\n').filter((l) => !l.startsWith('[gex] ')).join('\n').replace(/\n$/, '');
         const oom = page ? (r.err.match(/mmap\(\) error Out of memory/g) ?? []).length : 0;
-        let why = r.code !== code ? `exit ${r.code} (want ${code})` : oom ? `${oom} mmap ENOMEM ERR lines` : !new RegExp(`^(?:${want.source})$`).test(r.stdout) ? `its output is not /${want.source.slice(0, 120)}/` : '';
+        // (`code` null: any exit, but an exit)
+        let why = (code === null ? r.timedOut : r.code !== code) ? `exit ${r.code} (want ${code ?? 'any'})` : oom ? `${oom} mmap ENOMEM ERR lines` : !new RegExp(`^(?:${want.source})$`).test(r.stdout) ? `its output is not /${want.source.slice(0, 120)}/` : '';
         if (!why && out) why = frames(out, wayland.colors, wayland) ?? '';
-        check(`${name}: exit ${code}, its output${out ? ', its frames' : ''}`, !why, `${why}; stdout ${JSON.stringify(r.stdout.slice(-300))}; ${w.detail({ ...r, out: '' }, 6)}`);
+        check(`${name}: exit ${code ?? 'any'}, its output${out ? ', its frames' : ''}`, !why, `${why}; stdout ${JSON.stringify(r.stdout.slice(-300))}; ${w.detail({ ...r, out: '' }, 6)}`);
       } catch (e) {
         if (e instanceof Skip) throw e;
         check(`${name}: exit ${code}, its output`, false, String(e?.message ?? e));

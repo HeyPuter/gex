@@ -316,6 +316,10 @@ export async function gexccWin(t, w, o = {}, pre = '', only = null) {
  *   called again;
  * - cbthrow: a guest callback of a native function jumping out over the
  *   native frames, 4000 times, one and two native calls deep;
+ * - fibcb: fibers switched inside such callbacks, each fiber on a stack of
+ *   its own (a callback's call is open while another fiber runs), and the
+ *   two calls returning in the other order, which ends the process at
+ *   worst;
  * - comvt: Wine's own native functions through COM and C++ vtables and
  *   exports (fixtures/wow64/comvt.c; wow64/comvt.test.js runs it as i386).
  * `only` the names to run (all by default).
@@ -329,7 +333,7 @@ export async function guestNative(t, w, o = {}, pre = '', only = null) {
     }
     await w.nt({ want: allOk, ...o, name: `${pre}comvt`, exe });
   }
-  const progs = ['convmatrix', 'lateload', 'cbthrow'].filter(want);
+  const progs = ['convmatrix', 'lateload', 'cbthrow', 'fibcb'].filter(want);
   if (!progs.length) return;
   let dll;
   try { dll = await w.gexccWin(join(F, 'convdll.c'), 'convdll.dll', ['-O2', '-shared', join(F, 'convdll.def')]); } catch (e) {
@@ -344,6 +348,12 @@ export async function guestNative(t, w, o = {}, pre = '', only = null) {
       continue;
     }
     await w.nt({ want: allOk, ...o, name: `${pre}${n}`, exe, extra: [dll, `${dll}.wasm`] });
+    // Not last in, first out: may be refused, but by the process ending
+    // (any exit, any output short of a wrong result), never by hanging.
+    if (n === 'fibcb') {
+      await w.nt({ ...o, name: `${pre}fibcb interleaved`, exe, args: ['50', 'interleaved'], extra: [dll, `${dll}.wasm`], code: null,
+        want: /(ok interleaved[^\n]*\n0 failures)?/, timeout: Math.min(o.timeout ?? 300000, 300000) });
+    }
   }
 }
 
