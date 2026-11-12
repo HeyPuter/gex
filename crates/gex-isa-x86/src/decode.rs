@@ -1764,8 +1764,13 @@ impl<'a> Decoder<'a> {
             0x41 => self.sse3(Op::Dpp, F64, false, v, Self::ex(&m), immo),
             0x42 => self.sse3(Op::Mpsadbw, I8, false, v, Self::ex(&m), immo),
             0x44 => self.sse3(Op::Pclmulqdq, I64, false, v, Self::ex(&m), immo),
-            0x60 => self.sse3(Op::Pcmpestrm, I8, false, v, Self::ex(&m), immo),
-            0x61 => self.sse3(Op::Pcmpestri, I8, false, v, Self::ex(&m), immo),
+            // the explicit lengths are RAX and RDX under REX.W, else EAX and EDX
+            0x60 | 0x61 => {
+                let o = if op == 0x60 { Op::Pcmpestrm } else { Op::Pcmpestri };
+                let mut i = self.sse3(o, I8, false, v, Self::ex(&m), immo);
+                i.width = if self.rex_w() { Width::Q } else { Width::D };
+                i
+            }
             0x62 => self.sse3(Op::Pcmpistrm, I8, false, v, Self::ex(&m), immo),
             0x63 => self.sse3(Op::Pcmpistri, I8, false, v, Self::ex(&m), immo),
             _ => self.unk(),

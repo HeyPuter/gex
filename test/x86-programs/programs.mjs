@@ -5,6 +5,10 @@
 // here:
 //   - mem64-*: a 64-bit guest memory (gexc run --mem64), x86-64 only;
 //     sig-regs-threads x86-64 only (its loops are assembly);
+//   - SELF's programs check themselves against results a real CPU gave
+//     (sse4: SSSE3, SSE4.1, SSE4.2 and PCLMULQDQ), so no native run, which
+//     the host's CPU might not have: their output is NAME ok; x86-64 only,
+//     under tier-1, the function JIT and the function tier's C;
 //   - *smc*, copy-loop, null-access and sig-regs-threads under the function
 //     JIT as well (--fjit, which must leave writable-and-executable code to
 //     tier-1's guards); fp-modes under the function tier's C too (--cgen);
@@ -39,15 +43,17 @@ export const PAGE = new Set(`fork-dirs dense-lazy dense-holes spawn-threads serv
   sa-restart thread-churn kernel-contend exec-futex sleep-threads sendmsg-rights scm-fork ioctl-threads fdtable-threads mmap-threads codemap-threads proc-threads
   fs-threads sig-state-threads lift-threads fdmisc-threads task-ids sock-threads exec-dethread fork-thread-ctx fork-maps-threads fork-twice-thread quiet-threads
   fdobj-threads cred-threads kill-threads sigwait-threads poll-timeout tid-threads mount-threads exit-threads many-workers threads-many stale-loop-head file-stale-loop
-  stale-cross-page xattr mem64-wx mmap-coherent mmap-remap mmap-writeback null-access sig-regs-threads sig-pause fp-modes`.split(/\s+/));
+  stale-cross-page xattr mem64-wx mmap-coherent mmap-remap mmap-writeback null-access sig-regs-threads sig-pause fp-modes sse4`.split(/\s+/));
 const PAGE_ONLY = new Set(['spawn-threads', 'exec-dethread']);
+/** Programs that check themselves (no native run). */
+export const SELF = new Set(['sse4']);
 
 /** NAME's targets and native tiers (t1, fjit, cgen). */
 export function plan(name) {
-  const targets = name.startsWith('mem64-') || name === 'sig-regs-threads' ? ['x86_64-linux-musl'] : ['x86_64-linux-musl', 'x86-linux-musl'];
+  const targets = name.startsWith('mem64-') || name === 'sig-regs-threads' || SELF.has(name) ? ['x86_64-linux-musl'] : ['x86_64-linux-musl', 'x86-linux-musl'];
   let tiers = ['t1'];
   if (/smc/.test(name) || ['copy-loop', 'null-access', 'sig-regs-threads'].includes(name)) tiers = ['t1', 'fjit'];
-  if (name === 'fp-modes') tiers = ['t1', 'fjit', 'cgen'];
+  if (name === 'fp-modes' || SELF.has(name)) tiers = ['t1', 'fjit', 'cgen'];
   if (PAGE_ONLY.has(name)) tiers = [];
   return { targets, tiers, mem64: name.startsWith('mem64-') };
 }
@@ -97,6 +103,10 @@ export function x86Programs(t) {
         return bin;
       })();
       return builds[bin];
+    },
+    /** NAME's run on the host (`argv`), or for SELF's what it prints when right. */
+    native(name, argv) {
+      return SELF.has(name) ? Promise.resolve({ code: 0, out: `${name} ok`, err: '' }) : x.exec(argv);
     },
     /** `argv` as a process: `{ code, out, err }` (stdout, stderr), `code` as a shell gives it. */
     exec(argv, { env: more = {}, timeout = 120000 } = {}) {

@@ -6,6 +6,8 @@
 //! map to wasm SIMD lane ops where one exists and to shuffles otherwise.
 
 use crate::{ty_of, Flow, Lifter, FlagSource};
+
+mod sse4;
 use gex_ir::*;
 use gex_isa_x86::{Inst, Lane, Op, Operand, Reg, Width};
 
@@ -1574,7 +1576,7 @@ impl<'a> Lifter<'a> {
             | Op::Pcmpestrm
             | Op::Pclmulqdq
             | Op::Mpsadbw
-            | Op::Dpp => return self.illegal(),
+            | Op::Dpp => return self.sse4_op(i).unwrap_or_else(|| self.illegal()),
             // Every x87 register empty. The mm registers are separate from
             // the x87 stack in gex (see `mmx_op`), so that is all emms does.
             Op::Emms => {

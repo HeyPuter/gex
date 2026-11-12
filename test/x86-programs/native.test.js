@@ -14,7 +14,9 @@ export default async function (t) {
   const x = x86Programs(t);
   const gexc = x.g.need(process.env.GEXC_X86 || process.env.GEXC || join(ROOT, 'target/x86/release/gexc'), 'gexc');
   const legs = [];
-  for (const name of PROGRAMS) {
+  // GEX_TEST_ONLY: those programs alone (a comma list), to look at one
+  const only = process.env.GEX_TEST_ONLY?.split(',');
+  for (const name of only || PROGRAMS) {
     const p = plan(name);
     for (const target of p.targets) for (const tier of p.tiers) legs.push({ name, target, tier, mem64: p.mem64 });
   }
@@ -27,7 +29,7 @@ export default async function (t) {
       return t.check(`${leg}: builds`, false, e.message);
     }
     const args = await x.args(name);
-    const n = await x.exec([bin, ...args]);
+    const n = await x.native(name, [bin, ...args]);
     const flags = [...(mem64 ? ['--mem64'] : []), ...FLAGS[tier]];
     const g = await x.exec([gexc, 'run', ...flags, bin, ...args], { env: env(name, false) });
     t.check(`${leg}: as natively (exit ${n.code})`, n.out === g.out && n.code === g.code, `native exit ${n.code}, gex exit ${g.code}; ${differ(n.out, g.out)}`);

@@ -1673,8 +1673,8 @@ impl<'a> Lifter<'a> {
             }
             Op::Fxsave | Op::Fxrstor | Op::Xsave | Op::Xrstor => self.fxsave(i),
 
-            Op::Crc32
-            | Op::Andn
+            Op::Crc32 => self.crc32(i),
+            Op::Andn
             | Op::Bzhi
             | Op::Blsr
             | Op::Blsmsk

@@ -24,7 +24,7 @@ export default async function (t) {
       return t.check(`${leg}: builds`, false, e.message);
     }
     const args = await x.args(name);
-    const n = await x.exec([bin, ...args]);
+    const n = await x.native(name, [bin, ...args]);
     const opts = name === 'served-entries' ? { files: { [`/bin/${name}`]: bin, [`/bin/${name}-b`]: `${bin}-b` }, argv0: `/bin/${name}` }
       : SELF_EXEC.has(name) ? { files: { [`/bin/${name}`]: bin }, argv0: `/bin/${name}` } : {};
     const run = () => x.g.run(seed, bin, args, { ...opts, env: { GEX_LOG: 'off', GEX_SHARED: '1', GEX_MEM64: '1', ...env(name, true) }, timeout: 120000 });
