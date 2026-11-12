@@ -714,12 +714,19 @@ pub fn module_key(_engine: &Engine, _wasm: &[u8]) -> Option<String> {
     None
 }
 
+/// `wasm` compiled, as [`startup::passive_elems`] makes it.
+#[cfg(feature = "compile")]
+fn new_module(engine: &Engine, wasm: &[u8]) -> Result<Module> {
+    let easier = startup::passive_elems(wasm, startup::MIN_SLOTS);
+    Module::new(engine, easier.as_deref().unwrap_or(wasm)).map_err(anyhow::Error::from)
+}
+
 #[cfg(feature = "compile")]
 fn compile_here(engine: &Engine, wasm: &[u8]) -> Result<Module> {
     // `GEX_COMPILE_TRACE`: every compile here, its size and time, and who
     // asked (the first few frames of ours).
     let t0 = std::time::Instant::now();
-    let m = Module::new(engine, wasm).map_err(anyhow::Error::from);
+    let m = new_module(engine, wasm);
     if std::env::var_os("GEX_COMPILE_TRACE").is_some() {
         let bt = std::backtrace::Backtrace::force_capture().to_string();
         let who: Vec<&str> = bt
@@ -752,7 +759,7 @@ pub fn precompile(engine: &Engine, wasm: &[u8], dir: &Path) -> Result<()> {
     if path.exists() {
         return Ok(());
     }
-    let m = Module::new(engine, wasm).map_err(anyhow::Error::from)?;
+    let m = new_module(engine, wasm)?;
     std::fs::create_dir_all(dir)?;
     store(dir, &path, &m.serialize().map_err(anyhow::Error::from)?);
     Ok(())
@@ -779,6 +786,9 @@ fn store(dir: &Path, path: &Path, bytes: &[u8]) {
     }
 }
 
+
+#[cfg(feature = "compile")]
+mod startup;
 #[cfg(test)]
 mod tests {
     /// A hit must never leave the metadata visible in a partial state:
