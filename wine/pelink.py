@@ -197,6 +197,24 @@ def spec_own(spec):
     return out
 
 
+def spec_reexports(spec):
+    """The function names a .spec re-exports from a DLL it imports
+    (`-import` entries)."""
+    try:
+        lines = open(spec).read().splitlines()
+    except OSError:
+        return set()
+    out = set()
+    for line in lines:
+        parts = line.split('#', 1)[0].split()
+        if len(parts) < 3 or parts[1] not in ('stdcall', 'cdecl', 'thiscall', 'varargs', 'fastcall') or '-import' not in parts:
+            continue
+        rest = [t for t in parts[2:] if not t.startswith('-')]
+        if rest:
+            out.add(rest[0].split('(', 1)[0])
+    return out
+
+
 def spec_functions(spec):
     """The function names a .spec exports (its stdcall/cdecl/thiscall/
     varargs entries; not data, stubs or extern)."""
@@ -1160,6 +1178,18 @@ def link(dlls, out, gexrt, others=None):
         return first is None or first in vias
 
     for mod, ro, ex, imports in dlls:
+        # A `-import` re-export of a DLL the module only delay-imports
+        # (imagehlp's SymSetOptions, dbghelp's): gex binds the export to the
+        # owner's adapter when the module's DLL maps, which needs the
+        # owner's module installed, and its DLL loaded and attached, by
+        # then. Nothing would load it later: the export's callers never go
+        # through the module's delay thunks. So it loads with the module.
+        for name in sorted(spec_reexports(owner_spec(SRC, mod))) if SRC else ():
+            via = next((d for d in DELAY.get(mod, []) if lazy_delay(mod, d)
+                        and (d in exporters.get(name, ()) or d in forwards.get(name, {}))), None)
+            if via:
+                delay_eager.setdefault(mod, set()).add(via)
+                direct_refs.setdefault(grp(mod), set()).add(via)
         local = os.path.join(tmp, mod + '.l.o')
         alias_file = os.path.join(tmp, mod + '.aliases')
         with open(alias_file, 'w') as f:
