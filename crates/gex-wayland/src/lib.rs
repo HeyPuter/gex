@@ -1077,6 +1077,16 @@ impl Client {
 
     /// `GEX_WL_KEYTRACE=1`: every keyboard object made or released, and every
     /// enter, leave and key sent (a scripted key that a client never acts on).
+    /// `GEX_WL_CURSORTRACE`: every `wl_pointer.set_cursor`, the surface or
+    /// none (a hidden pointer), as `[wl-cursor]`: what a test of the pointer
+    /// over a client's windows reads.
+    fn cursortrace(what: &str) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *ON.get_or_init(|| std::env::var_os("GEX_WL_CURSORTRACE").is_some()) {
+            eprintln!("[wl-cursor] {what}");
+        }
+    }
+
     fn keytrace(what: &str) {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *ON.get_or_init(|| std::env::var_os("GEX_WL_KEYTRACE").is_some()) {
@@ -1173,6 +1183,7 @@ impl Client {
                             let (_serial, cursor, hx, hy) =
                                 (r.uint(), r.object(), r.int(), r.int());
                             let cursor = cursor.unwrap_or(0);
+                            Self::cursortrace(&if cursor != 0 { format!("surface {cursor}") } else { "none".to_string() });
                             if let Some(prev) = self.cursor_surface.take() {
                                 if prev != cursor {
                                     if let Some(s) = self.surfaces.get_mut(&prev) {
