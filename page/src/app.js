@@ -317,7 +317,8 @@ function progressMeter(state, onProgress) {
           // A native module (a Wine builtin) is `providers/<name>-<fingerprint>.wasm`.
           name = unit === 'providers' ? rel.slice('providers/'.length).replace(/-[0-9a-f]+\.wasm$/i, '') : unitNames[unit] || '';
         } else {
-          try { key = decodeURIComponent(new URL(m.what, globalThis.location?.href).pathname); } catch {}
+          // (with its `#OFFSET`: a file in the rest bundle is named by it, not by the bundle)
+          try { const u = new URL(m.what, globalThis.location?.href); key = decodeURIComponent(u.pathname + u.hash); } catch {}
           const l = lazyNames.get(key);
           name = l?.name ?? key.split('/').pop();
           total = l?.size ?? 0;
