@@ -37,10 +37,11 @@ CC=$PREFIX/bin/x86_64-w64-mingw32-gcc
 clang --target=wasm64-unknown-unknown -mexception-handling -c "$HERE/rt/cpp_exception.s" -o "$T/cpp_exception.o"
 "$CC" -O2 -c "$HERE/rt/wchar.c" -o "$T/wchar.o"
 "$CC" -O2 -c "$HERE/rt/dirent.c" -o "$T/dirent.o"
+"$CC" -O2 -c "$HERE/rt/math.c" -o "$T/math.o"
 for k in main wmain dll; do GEX_WASM_NO_ICALL=1 "$CC" -O2 -DONLY_$k -c "$HERE/rt/start.c" -o "$L/start_$k.o"; done
 for k in 0 3; do "$CC" -O2 -DONLY_$k -c "$HERE/rt/wmain.c" -o "$L/wmain$k.o"; done
 rm -f "$L/libgexcc-win.a"
-llvm-ar rcs "$L/libgexcc-win.a" "$T/cpp_exception.o" "$T/wchar.o" "$T/dirent.o"
+llvm-ar rcs "$L/libgexcc-win.a" "$T/cpp_exception.o" "$T/wchar.o" "$T/dirent.o" "$T/math.o"
 # setjmp/longjmp, a copy of the program's own (a program has no core beside
 # it to share the tag with): libgexrt's
 (cd "$T" && llvm-ar x "$WB/libs/gexrt/libgexrt.a" wasm32_sjlj.o) && mv "$T/wasm32_sjlj.o" "$L/"
