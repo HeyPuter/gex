@@ -122,7 +122,7 @@ V=$( { echo "$SC"; cat "$here/link-wineserver.sh"; } | sha256sum | cut -c1-6)
 # Unix-side change rebuilds only the wasm64 tree and the server.
 P=$(git -C "$W" ls-tree -r HEAD | grep -v -P '\t(dlls/[^/]+/unix/|server/|loader/)' | sha256sum | cut -c1-12)
 # The tools only by what builds them, so a DLL change keeps them.
-TP=$(git -C "$W" ls-tree -r HEAD | grep -P '\t(tools/|include/|libs/|nls/|configure|aclocal.m4|Makefile.in$)' | sha256sum | cut -c1-12)
+TP=$( { git -C "$W" ls-tree -r HEAD | grep -P '\t(tools/|include/|libs/|nls/|configure|aclocal.m4|Makefile.in$)'; echo win64; } | sha256sum | cut -c1-12)
 # The display libraries are keyed by what builds them; the wasm64 tree by
 # those, the link and gex-gl's guest library (linked into the loader).
 DH=$( { realpath "$GEX_WASM64_SYSROOT"; cat "$here"/wcc64 "$here"/../toolchain/sysroot/flags64.sh "$here"/deps64.sh "$here"/libs.pins \
@@ -235,7 +235,9 @@ step() { # NAME CMD...: run CMD in a fresh CACHE/NAME (build trees name their ow
 }
 
 tools_build() {
-	"$W/configure" --enable-archs= --without-mingw --disable-tests $without
+	# 64-bit tools (--enable-win64; with no archs configure would make them
+	# -m32): a large program's link needs more than winebuild's 4 GiB
+	"$W/configure" --enable-win64 --enable-archs= --without-mingw --disable-tests $without
 	nice -n 10 make -j"$J" __tooldeps__ nls/locale.nls
 }
 log "tools ($TP)"; step tools-$TP tools_build
