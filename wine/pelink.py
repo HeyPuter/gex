@@ -563,6 +563,25 @@ def dll_slots(path, mapfile, obj_dll):
     return ''.join(f'{dll} {kind} {lo:x} {hi:x}\n' for (dll, kind), rs in sorted(ranges.items()) for lo, hi in rs)
 
 
+def drop_custom(path, names):
+    """A module without the custom sections `names` (link-time inputs only,
+    which wasm-ld concatenates and wasm-opt keeps)."""
+    b = open(path, 'rb').read()
+    out, i, dropped = bytearray(b[:8]), 8, False
+    while i < len(b):
+        size, j = leb_at(b, i + 1)
+        if b[i] == 0:
+            n, k = leb_at(b, j)
+            if b[k:k + n].decode('utf-8', 'replace') in names:
+                dropped = True
+                i = j + size
+                continue
+        out += b[i:j + size]
+        i = j + size
+    if dropped:
+        open(path, 'wb').write(out)
+
+
 def name_imports(path):
     """A --split module's function imports named by their symbols: wasm-ld
     keeps an undefined symbol's original import name (env.strlen) though
@@ -1689,6 +1708,9 @@ static void *gexw_ntdll_proc(const char *name)
                                    '--enable-mutable-globals', '--enable-sign-ext', '--enable-nontrapping-float-to-int',
                                    '--enable-exception-handling', '--enable-reference-types',
                                    '--translate-to-exnref', '-o', out])
+        # (gexw.sig64, the ICALL pass's signatures: read from the defining
+        # DLL's objects and side module at link time, never from the module)
+        drop_custom(out, {'gexw.sig64'})
         # The forwards, for gex to bind a -import re-export of a forwarded name
         # (kernel32's HeapFree is kernelbase's, which forwards to ntdll's
         # RtlFreeHeap): a custom section `gexw.forwards`, lines `name dll!target`.
