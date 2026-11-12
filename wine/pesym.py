@@ -140,7 +140,7 @@ def rewrite(b, fix, aliases=()):
                 # ICALL pass's entry-thunk pairs (`gexw_entries`), which
                 # nothing references but gex.
                 count, s = leb(b, r)
-                segs = enc(count)
+                segs = bytearray(enc(count))
                 for _ in range(count):
                     nm, s = name(b, s)
                     align, s = leb(b, s)
