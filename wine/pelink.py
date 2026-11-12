@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Link Wine's PE side as one wasm module.
 
-    pelink.py [--split FILE DLL,...] [--exports-of CORE.wasm] [--extra NAME R.O EXPORTS IMPORTS ...] WINE_BUILD WINE_SRC OUT.wasm [DLL ...]
+    pelink.py [--split FILE DLL,...] [--exports-of CORE.wasm] [--extra NAME R.O EXPORTS IMPORTS ...] [--stub-imports] WINE_BUILD WINE_SRC OUT.wasm [DLL ...]
     pelink.py --gexrt LIBGEXRT.a -o OUT.wasm --dll NAME R.o EXPORTS [IMPORTS,...] ...
 
 For each DLL (all of them, or those named), the build left the DLL as one
@@ -56,6 +56,8 @@ M64 = False  # of those, the memory64 flavour: not lowered (pelink's main)
 SPLIT = {}  # DLL -> the module of its own it is linked into, not the core (--split)
 STATIC = {}  # DLL -> the static libraries its IMPORTS name (libuuid.a), as paths (pelink's main)
 KEEP_EXPORTS = set()  # names the core exports if it defines them (--exports-of)
+STUB_IMPORTS = False  # a program's missing imports bound to stubs (--stub-imports)
+EXTRA = set()  # the --extra DLLs (pelink's main)
 
 
 def cc(*args):
@@ -260,6 +262,16 @@ def main():
     while sys.argv[1] == '--extra':
         extra.append((sys.argv[2], sys.argv[3], sys.argv[4], [i for i in sys.argv[5].split(',') if i]))
         del sys.argv[1:6]
+    # --stub-imports (gexcc-win's link of a program, a --split module of
+    # --extra DLLs): a function the program imports that no module exports is
+    # bound, as Wine's loader binds an import its DLL does not export, to a
+    # stub that raises EXCEPTION_WINE_STUB when called; each is listed. The
+    # core and the tree's DLLs stay checked (check_imports).
+    global STUB_IMPORTS
+    if sys.argv[1] == '--stub-imports':
+        STUB_IMPORTS = True
+        del sys.argv[1]
+    EXTRA.update(e[0] for e in extra)
     build, src, out = sys.argv[1:4]
     global SRC, BUILD
     SRC = src
@@ -670,6 +682,67 @@ def with_static_exports(dlls):
         subprocess.check_call(['wasm-ld'] + (['-mwasm64'] if WINE64 else []) + ['-r', '-o', merged, ro] + objs)
         out.append((mod, merged, ex, imports))
     return out
+
+
+def stub_imports(objs, dlls, grp, sigs, syms, shim, elsewhere, gexrt, needs, tmp):
+    """--stub-imports: each program module's function imports that no module
+    defines get a definition in the module, raising EXCEPTION_WINE_STUB with
+    the DLL whose .spec lists the name (as a stub or commented out), as
+    Wine's stub entry points do: an unhandled one ends the process with
+    "unimplemented function DLL.NAME". The core exports RaiseException for
+    them."""
+    rt = syms([gexrt], '--defined-only') if gexrt else set()
+    ctype = {'i': 'int', 'I': 'long long', 'f': 'float', 'd': 'double', 'v': 'void'}
+    owners = None
+    for g in objs:
+        mods = [m for m, _, _, _ in dlls if grp(m) == g]
+        if not g or not mods or not all(m in EXTRA for m in mods):
+            continue
+        undef = syms(objs[g], '--undefined-only') - syms(objs[g], '--defined-only')
+        gaps = {}
+        for m in mods:
+            for (n, k), sig in sigs.get(m, {}).items():
+                if (k == 'undefined' and n in undef and '!' not in n and n not in elsewhere and n not in rt
+                        and n not in shim and n not in LOADER_IMPORTS and n not in WEAK_IMPORTS
+                        and n not in CROSS_MODE and not n.startswith(('__gexw_', 'gexw_', '__wasm'))):
+                    gaps.setdefault(n, sig)
+        if not gaps:
+            continue
+        if owners is None:
+            # (the stubs and commented-out entries of the tree's .spec files)
+            owners = {}
+            for d in sorted(os.listdir(os.path.join(SRC, 'dlls'))):
+                mod = makefile_var(os.path.join(SRC, 'dlls', d, 'Makefile.in'), 'MODULE')
+                if not mod:
+                    continue
+                try:
+                    lines = open(spec_path(SRC, 'dlls', d, mod[0])).read().splitlines()
+                except OSError:
+                    continue
+                for line in lines:
+                    w = line.lstrip('# ').split()
+                    if len(w) >= 3 and w[0] == '@':
+                        owners.setdefault(w[-1] if w[1] == 'stub' else w[2].split('(')[0], mod[0])
+        src = os.path.join(tmp, f'stubs{g}.c')
+        with open(src, 'w') as f:
+            f.write('void __stdcall gexw_raise(unsigned int, unsigned int, unsigned int, const unsigned long long *)'
+                    ' __asm__("kernelbase.dll!RaiseException");\n'
+                    'static void gexw_stub(const char *dll, const char *name)\n{\n'
+                    '    const unsigned long long args[2] = { (unsigned long long)dll, (unsigned long long)name };\n'
+                    '    for (;;) gexw_raise(0x80000100 /* EXCEPTION_WINE_STUB */, 1 /* EXCEPTION_NONCONTINUABLE */, 2, args);\n}\n')
+            for k, (n, sig) in enumerate(sorted(gaps.items())):
+                r, ps = sig.split(':')
+                params = ', '.join(f'{ctype[c]} a{i}' for i, c in enumerate(ps)) or 'void'
+                f.write(f'{ctype[r]} s{k}({params}) __asm__("{n}");\n'
+                        f'{ctype[r]} s{k}({params}) {{ gexw_stub("{owners.get(n, "?")}", "{n}"); for (;;); }}\n')
+        obj = os.path.join(tmp, f'stubs{g}.o')
+        subprocess.check_call(cc('-O2', '-D_WIN32', '-c', '-o', obj, src))
+        objs[g].append(obj)
+        needs.add('kernelbase.dll!RaiseException')
+        elsewhere |= set(gaps)
+        print(f'pelink: warning: {g}: {len(gaps)} imports no DLL exports, bound to stubs that raise '
+              f'EXCEPTION_WINE_STUB when called: ' + ' '.join(f'{owners.get(n, "?")}.{n}' for n in sorted(gaps)),
+              file=sys.stderr)
 
 
 def link(dlls, out, gexrt, others=None):
@@ -1465,6 +1538,8 @@ static void *gexw_ntdll_proc(const char *name)
     # what each module defines, for the others' imports
     elsewhere = {n for g in objs for n in syms(objs[g], '--defined-only')} if SPLIT else set()
     main_out = out
+    if STUB_IMPORTS:
+        stub_imports(objs, dlls, grp, sigs, syms, shim, elsewhere, gexrt, needs, tmp)
     def emit(g, out, gexrt):
         rsp = os.path.join(tmp, f'exports{g}.rsp')
         with open(rsp, 'w') as f:

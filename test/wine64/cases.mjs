@@ -1,7 +1,7 @@
 // The case sets 64-bit Wine's tests share, natively and on the page
 // (winerun.mjs's `nt`): each a function of a session `w` and `o`, the
 // options every case gets (`page`, `env`), and a `pre` for its names.
-import { copyFileSync, existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { Skip } from '../lib/t.js';
 import { graphics, ppm, ROOT } from '../lib/winerun.mjs';
@@ -217,6 +217,23 @@ export async function gexccWin(t, w, o = {}, pre = '', only = null) {
   await one('cbfault', join(F, 'cbfault.c'), ['-O1'], { nullDriver: true,
     want: /cbfault: sending\ncbfault: veh c0000005\n([^\n]*\n)*cbfault: returned 0, veh [0-9]+/ });
   await one('ptval', join(F, 'ptval.c'), ['-O1', '-mwindows'], { nullDriver: true });
+  if (want('missimp')) {
+    // an import no DLL exports: a stub, listed at the link; the program
+    // runs, and a call of it ends the process as Wine's stubs do
+    let exe;
+    try { exe = await w.gexccWin(join(F, 'missimp.c'), 'missimp.exe', ['-O1', '-ladvapi32']); } catch (e) {
+      if (e instanceof Skip) throw e;
+      exe = null; t.check(`${pre}missimp: build`, false, String(e.message));
+    }
+    if (exe) {
+      t.check(`${pre}missimp: the link lists the stub`,
+        /pelink: warning: .*advapi32\.dll\.RegOpenKeyTransactedW/.test(readFileSync(`${exe}.build`, 'utf8')));
+      await w.nt({ want: /missimp: start\nmissimp: done/, ...o, name: `${pre}missimp`, exe, extra: [`${exe}.wasm`] });
+      const r = await w.nt({ want: /missimp: start/, ...o, name: `${pre}missimp-call`, exe, args: ['call'], extra: [`${exe}.wasm`], code: 1 });
+      if (r) t.check(`${pre}missimp-call: Unimplemented function advapi32.dll.RegOpenKeyTransactedW`,
+        /Unimplemented function advapi32\.dll\.RegOpenKeyTransactedW called/.test(`${r.out}\n${r.err}`), w.detail(r));
+    }
+  }
   await one('hostdatacc', join(W, 'hostdata.c'), ['-O2']);
   if (want('wmain0')) {
     // wmain(void) compiled and linked in one step

@@ -12,6 +12,9 @@
 //   access violation its vectored handler sees, and the process goes on;
 // - ptval: user32 calls taking a POINT by value, directly and through
 //   GetProcAddress's pointers;
+// - missimp: an import no DLL exports, bound to a stub (listed at the
+//   link): the program runs, and a call of it ends the process as Wine's
+//   stubs do;
 // - hostdatacc: hostdata.c's statics, gex's memory outside every image;
 // - wmain0, wmain3: wmain(void) and wmain(argc, argv, envp);
 // - xthr: a just-loaded DLL's function called by a thread with no system

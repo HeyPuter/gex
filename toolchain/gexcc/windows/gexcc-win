@@ -325,10 +325,12 @@ try:
     log = os.path.join(tmp, 'pelink.log')
     with open(log, 'w') as lf:
         r = subprocess.call([sys.executable, W + '/pelink.py', '--wasm64', '--split', name + '.wasm', name,
-                             '--extra', name, so + '.r.o', so + '.exports', ','.join(deps), B, S,
+                             '--extra', name, so + '.r.o', so + '.exports', ','.join(deps), '--stub-imports', B, S,
                              os.path.join(tmp, 'core.wasm')] + core, env=env, stdout=lf, stderr=subprocess.STDOUT)
     if r:
         sys.stderr.write(open(log).read()[-4000:]); sys.exit(r)
+    # (its warnings: the imports bound to stubs, --stub-imports)
+    sys.stderr.writelines(l for l in open(log) if l.startswith('pelink: warning:'))
     odir = os.path.dirname(os.path.abspath(out))
     # (the loader runs an exported __wasm_call_ctors when it installs the
     # module, before the DLLs the constructors call are loaded)
