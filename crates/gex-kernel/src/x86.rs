@@ -739,17 +739,18 @@ pub fn canonical_number(raw: u64) -> u64 {
     translate(raw, &mut a, &mut m, 0, 0)
 }
 
-/// The processor gex claims to be: an SSSE3-era Intel core (family 6, model
-/// 15) with the baseline x86-64 feature set plus SSE3, SSSE3, CMPXCHG16B and
-/// POPCNT -- exactly the instruction set the lifter implements, so glibc's
-/// IFUNC resolvers pick code gex can run. No AVX, no SSE4, no XSAVE.
+/// The processor gex claims to be: an Intel core (family 6, model 15) with
+/// the baseline x86-64 feature set plus SSE3, SSSE3, SSE4.1, SSE4.2,
+/// PCLMULQDQ, CMPXCHG16B and POPCNT (x86-64-v2) -- exactly the instruction
+/// set the lifter implements, so glibc's IFUNC resolvers pick code gex can
+/// run. No AVX, no XSAVE.
 pub fn cpuid(leaf: u32, sub: u32) -> [u32; 4] {
     match leaf {
         0 => [7, 0x756e_6547, 0x6c65_746e, 0x4965_6e69], // "GenuineIntel"
         1 => {
             let eax = 0x0000_06fb; // family 6, model 15, stepping 11
             let ebx = 0x0001_0800; // 1 logical processor, 64-byte clflush line
-            let ecx = 1 | (1 << 9) | (1 << 13) | (1 << 23); // SSE3 SSSE3 CX16 POPCNT
+            let ecx = 1 | (1 << 1) | (1 << 9) | (1 << 13) | (1 << 19) | (1 << 20) | (1 << 23); // SSE3 PCLMULQDQ SSSE3 CX16 SSE4.1 SSE4.2 POPCNT
             let edx = (1 << 0)
                 | (1 << 4)
                 | (1 << 8)
@@ -1226,7 +1227,7 @@ pub const CPUINFO: &str = concat!(
     "fpu_exception\t: yes\n",
     "cpuid level\t: 7\n",
     "wp\t\t: yes\n",
-    "flags\t\t: fpu tsc cx8 cmov clflush mmx fxsr sse sse2 syscall nx rdtscp lm pni ssse3 cx16 popcnt lahf_lm\n",
+    "flags\t\t: fpu tsc cx8 cmov clflush mmx fxsr sse sse2 syscall nx rdtscp lm pni pclmulqdq ssse3 cx16 sse4_1 sse4_2 popcnt lahf_lm\n",
     "bogomips\t: 2000.00\n",
     "clflush size\t: 64\n",
     "cache_alignment\t: 64\n",

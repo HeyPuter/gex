@@ -4,9 +4,10 @@
  * trunc, round and their float
  * forms. Each result is exact, so it is glibc's bit for bit; a NaN comes
  * back quieted, as glibc's x + x makes it (wasm would be free to choose
- * the payload). Under gex's CPUID (no SSE4.1) glibc's IFUNCs pick the C
- * versions, bit manipulation (__floorf_c can be a visible share of a
- * program's time). No
+ * the payload). The host binds each IFUNC's resolver, so these replace
+ * whichever variant glibc's CPUID check would pick (the C versions are bit
+ * manipulation, and __floorf_c can be a visible share of a program's time;
+ * the SSE4.1 ones are a roundsd each). No
  * exception flags are raised here; glibc's raise none for these either,
  * except invalid for a signalling NaN. sin, cos and sincos stay glibc's:
  * nothing short of glibc's own algorithm returns its bits. */
