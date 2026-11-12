@@ -459,7 +459,9 @@ GEX_INLINE uint32_t gex_ftab_idx(uint64_t t) {
    tier-1 does it (gex-emit's emit_misaligned_atomic), so the two tiers stay
    atomic against each other: inside one aligned 8-byte word, a
    compare-exchange loop on that word; across two, under the lock word at
-   GEX_SPLIT_LOCK (shared with tier-1), the first such access reported.
+   GEX_SPLIT_LOCK (shared with tier-1), the first such access reported, each
+   word written by a compare-exchange that keeps what others wrote to the
+   bytes around the value meanwhile.
    `op`: 0 compare-exchange (a expected, b replacement), 1 add, 2 sub, 3 and,
    4 or, 5 xor, 6 exchange (a the operand). Returns the old value. */
 #define GEX_LK_CAS 0
@@ -502,15 +504,41 @@ static __attribute__((noinline)) uint64_t gex_locked_misaligned(int ctx, int64_t
     }
     while (GEX_CAS(gex_a32, GEX_P(GEX_SPLIT_LOCK), 0u, 1u) != 0u) {
     }
-    uint64_t old = bytes == 8 ? *(gex_u64 *)GEX_P(ea) : bytes == 4 ? *(gex_u32 *)GEX_P(ea) : *(gex_u16 *)GEX_P(ea);
-    if (op != GEX_LK_CAS || old == (a & field)) {
+    /* The value's low part is the first word's top `lo` bits, its high part
+       the second word's low bits (m1). */
+    uint32_t wa = ea & ~7u;
+    uint32_t sh = (ea & 7u) * 8u, lo = 64u - sh;
+    uint64_t keep0 = (1ull << sh) - 1, m1 = (1ull << (sh + bytes * 8u - 64u)) - 1, old;
+    for (int again = 1; again;) {
+        uint64_t w0 = __atomic_load_n((gex_a64 *)GEX_P(wa), __ATOMIC_SEQ_CST);
+        uint64_t w1 = __atomic_load_n((gex_a64 *)GEX_P(wa + 8u), __ATOMIC_SEQ_CST);
+        old = ((w0 >> sh) | (w1 << lo)) & field;
+        if (op == GEX_LK_CAS && old != (a & field))
+            break;
         uint64_t nv = gex_lk_apply(op, old, a, b) & field;
-        if (bytes == 8)
-            *(gex_u64 *)GEX_P(ea) = nv;
-        else if (bytes == 4)
-            *(gex_u32 *)GEX_P(ea) = (uint32_t)nv;
-        else
-            *(gex_u16 *)GEX_P(ea) = (uint16_t)nv;
+        uint64_t n0 = (w0 & keep0) | (nv << sh);
+        /* the first word changed since: all again */
+        if (GEX_CAS(gex_a64, GEX_P(wa), w0, n0) != w0)
+            continue;
+        for (again = 0;;) {
+            uint64_t got = GEX_CAS(gex_a64, GEX_P(wa + 8u), w1, (w1 & ~m1) | (nv >> lo));
+            if (got == w1)
+                break;
+            if ((got ^ w1) & m1) {
+                /* the value's own bytes there changed: its bytes in the
+                   first word put back while they hold what this wrote, and
+                   all again */
+                for (uint64_t c0 = n0; !((c0 ^ n0) & ~keep0);) {
+                    uint64_t g = GEX_CAS(gex_a64, GEX_P(wa), c0, (c0 & keep0) | (w0 & ~keep0));
+                    if (g == c0)
+                        break;
+                    c0 = g;
+                }
+                again = 1;
+                break;
+            }
+            w1 = got;
+        }
     }
     __atomic_store_n((gex_a32 *)GEX_P(GEX_SPLIT_LOCK), 0u, __ATOMIC_SEQ_CST);
     return old;
