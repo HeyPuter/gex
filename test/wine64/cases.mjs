@@ -302,6 +302,56 @@ export async function gexccWin(t, w, o = {}, pre = '', only = null) {
   for (const n of ['xthr', 'xhoist']) await one(n, join(F, `${n}.c`), ['-O2'], { extra: [dll, `${dll}.wasm`] });
 }
 
+/**
+ * Guest x86-64 code calling native code (fixtures/wine64/conv.h): convdll.c
+ * built with GEX_TEST_GEXCC_WIN (a native DLL; a skip without it) beside
+ * MinGW programs (guest code):
+ * - convmatrix: every Win64 shape (16 arguments, mixed XMM and integer,
+ *   narrow integers with other bits above, structs by value and by
+ *   reference, small and large struct results, floating point, a guest
+ *   callback) through conv_table()'s pointers (the module's entry path)
+ *   and through GetProcAddress (the export path);
+ * - lateload: the DLL loaded while another thread spins with no system
+ *   call, its functions called from that thread, unloaded, loaded and
+ *   called again;
+ * - cbthrow: a guest callback of a native function jumping out over the
+ *   native frames, 4000 times, one and two native calls deep;
+ * - comvt: Wine's own native functions through COM and C++ vtables and
+ *   exports (fixtures/wow64/comvt.c; wow64/comvt.test.js runs it as i386).
+ * `only` the names to run (all by default).
+ */
+export async function guestNative(t, w, o = {}, pre = '', only = null) {
+  const want = (n) => !only || only.includes(n);
+  if (want('comvt')) {
+    let exe;
+    try { exe = await w.mingw('comvt', { x64: true, out: 'comvt64.exe', libs: ['-lole32', '-luuid'] }); } catch (e) {
+      return t.check(`${pre}comvt: build`, false, String(e.message));
+    }
+    await w.nt({ want: allOk, ...o, name: `${pre}comvt`, exe });
+  }
+  const progs = ['convmatrix', 'lateload', 'cbthrow'].filter(want);
+  if (!progs.length) return;
+  let dll;
+  try { dll = await w.gexccWin(join(F, 'convdll.c'), 'convdll.dll', ['-O2', '-shared', join(F, 'convdll.def')]); } catch (e) {
+    if (e instanceof Skip) throw e;
+    return t.check(`${pre}convdll: build`, false, String(e.message));
+  }
+  const src = { convmatrix: 'convmain' };
+  for (const n of progs) {
+    let exe;
+    try { exe = await w.mingw(n, { x64: true, src: join(F, `${src[n] ?? n}.c`), flags: [`-I${F}`] }); } catch (e) {
+      t.check(`${pre}${n}: build`, false, String(e.message));
+      continue;
+    }
+    // cbthrow hangs today on two jumps out in a row with no native entry
+    // between: gexrt keeps its call-out records on the stack just above the
+    // callee's frame, which the guest reuses once it has jumped above them
+    // (less than NATIVE_UNWOUND), and the next entry reads them.
+    const known = n === 'cbthrow' ? { known: 'gexrt call-out records on the guest stack: Wine core', timeout: Math.min(o.timeout ?? 300000, 300000) } : {};
+    await w.nt({ want: allOk, ...o, ...known, name: `${pre}${n}`, exe, extra: [dll, `${dll}.wasm`] });
+  }
+}
+
 const WL = join(ROOT, 'test/fixtures/wine');
 
 /** The Wayland driver for a case under gexc's compositor: `userReg`, and a

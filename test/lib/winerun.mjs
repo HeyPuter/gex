@@ -496,7 +496,9 @@ function session(t, { kind, distSrc, pfxSrc, monoSrc = null, nativeSrc = null, w
      * 2 GiB: a Wine that takes it for 4 GiB tries the top for each stack).
      * `env`: node's or gexc's own. Checks it, and resolves the run.
      */
-    async nt({ name, code = 0, want, exe, args = [], extra = [], nullDriver = false, wayland, gl = false, wineEnv = {}, timeout = 300000, page, env: more = {} }) {
+    async nt({ name, code = 0, want, exe, args = [], extra = [], nullDriver = false, wayland, gl = false, wineEnv = {}, timeout = 300000, page, env: more = {}, known }) {
+      // `known`: who has this run's failure (t.known), when it is one today
+      const check = known ? (what, ok, detail) => t.known(what, ok, detail, known) : (what, ok, detail) => t.check(what, ok, detail);
       let r;
       try {
         const src = exe.includes('/') ? exe : w.prog(exe);
@@ -522,10 +524,10 @@ function session(t, { kind, distSrc, pfxSrc, monoSrc = null, nativeSrc = null, w
         const oom = page ? (r.err.match(/mmap\(\) error Out of memory/g) ?? []).length : 0;
         let why = r.code !== code ? `exit ${r.code} (want ${code})` : oom ? `${oom} mmap ENOMEM ERR lines` : !new RegExp(`^(?:${want.source})$`).test(r.stdout) ? `its output is not /${want.source.slice(0, 120)}/` : '';
         if (!why && out) why = frames(out, wayland.colors, wayland) ?? '';
-        t.check(`${name}: exit ${code}, its output${out ? ', its frames' : ''}`, !why, `${why}; stdout ${JSON.stringify(r.stdout.slice(-300))}; ${w.detail({ ...r, out: '' }, 6)}`);
+        check(`${name}: exit ${code}, its output${out ? ', its frames' : ''}`, !why, `${why}; stdout ${JSON.stringify(r.stdout.slice(-300))}; ${w.detail({ ...r, out: '' }, 6)}`);
       } catch (e) {
         if (e instanceof Skip) throw e;
-        t.check(`${name}: exit ${code}, its output`, false, String(e?.message ?? e));
+        check(`${name}: exit ${code}, its output`, false, String(e?.message ?? e));
       }
       return r;
     },
