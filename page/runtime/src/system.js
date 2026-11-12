@@ -1115,8 +1115,12 @@ export class System extends EventTarget {
   }
 
   /** The lazy files' owner for boot's `layers` (see boot): its control
-   *  buffer for every Worker (`{ ctl }`), or null where there is none. */
+   *  buffer for every Worker (`{ ctl }`), or null where there is none. One
+   *  the page made already (an ejected page's, which also downloads the rest
+   *  bundle ahead into its cache) is the owner: a second one beside it read
+   *  from a cache of its own and fetched again what the first had stored. */
   async #lazyOwner(rt, kernel, layers, stops) {
+    if (this.#preset.host.lazyCache) return this.#preset.host.lazyCache;
     const lazy = layers.flatMap((l) => l.lazy ?? []);
     if (!MP_CODE || !lazy.length || typeof Worker !== 'function' || typeof caches !== 'object' || typeof SharedArrayBuffer !== 'function'
       || !(kernel.memory?.buffer instanceof SharedArrayBuffer)) return null;
