@@ -5,7 +5,8 @@
 // procedures (fromaddr), a skeleton's view unmapped and its addresses
 // reused (stalebind), native DLLs freed and loaded again (dllreload),
 // gex's memory outside every image (hostdata), and gexcc-win programs'
-// own native modules (GEX_TEST_GEXCC_WIN; skipped without it); and the
+// own native modules (GEX_TEST_GEXCC_WIN; skipped without it), one with
+// more data than the PE data window holds (bigdata); and the
 // console set, with the audio player on (compact.test.js runs it without).
 import { allOk, asio, CONSOLE, each, gexccWin } from '../wine64/cases.mjs';
 import { wine64 } from '../lib/winerun.mjs';
@@ -23,7 +24,7 @@ export default async function (t) {
   await asio(t, w, o, pre);
   await each(w, ['fromaddr', 'hostdata', 'stalebind', 'dllreload'].map((n) => ({ name: n, want: allOk, exe: `${n}.exe` })), o, pre);
   try {
-    await gexccWin(t, w, o, pre, ['cxxcatch', 'xthr', 'xhoist', 'cxxthr', 'dllimps', 'lresult', 'cbfault', 'ptval', 'selfaddr']);
+    await gexccWin(t, w, o, pre, ['cxxcatch', 'xthr', 'xhoist', 'cxxthr', 'dllimps', 'lresult', 'cbfault', 'ptval', 'selfaddr', 'bigdata']);
   } catch (e) {
     if (!(e instanceof Skip)) throw e;
     t.say(`${pre}gexcc-win: ${e.message}`);

@@ -728,10 +728,15 @@ fn install_module(
 
     let (size, align) = dylink_memory(&wasm)?;
     let a = 1u64 << align;
-    // (an LLP64 module's above the images: see `crate::wine64_pe_data`;
-    // and an i386 module's in a 64-bit process, whose 64-bit side finds
-    // ntdll's data exports so, wow64's Wow64Transition)
-    let data = if is64 || alt {
+    let data_exports = exported_offsets(&wasm)?;
+    // (an LLP64 module's above the images when it has data exports, whose
+    // export table holds their RVAs from the skeleton: see
+    // `crate::wine64_pe_data`; and an i386 module's in a 64-bit process,
+    // whose 64-bit side finds ntdll's data exports so, wow64's
+    // Wow64Transition. A module without any, a program's, has nothing
+    // relative to its skeleton and may be larger than the window.)
+    let rva_data = data_exports.keys().any(|k| k.split_once('!').is_some_and(|(_, n)| !n.starts_with("__gexw_")));
+    let data = if (is64 || alt) && rva_data {
         alloc_pe_data_window(&mut g.data_low, (size as u64).max(16) + a, "[wine PE data]")?
     } else {
         provider_alloc_top_bytes((size as u64).max(16) + a, "[wine PE data]")?
@@ -755,7 +760,6 @@ fn install_module(
             }
         }
     }
-    let data_exports = exported_offsets(&wasm)?;
     let exports: std::collections::HashSet<String> = sh.exports.iter().map(|(n, _)| n.clone()).collect();
     let funcs: std::collections::HashSet<String> = sh.exports.iter().filter(|(_, f)| *f).map(|(n, _)| n.clone()).collect();
     let number = lock(&PROVIDERS).len() as u32;

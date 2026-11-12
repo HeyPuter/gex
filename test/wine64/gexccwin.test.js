@@ -14,6 +14,9 @@
 //   GetProcAddress's pointers;
 // - selfaddr: GetModuleHandleExW(FROM_ADDRESS) on the program's own data,
 //   zeroed data and function is the program's module;
+// - bigdata: 24 MiB of zeroed data, more than the page's PE data window
+//   for builtins' data exports holds: its ends written and read, and the
+//   program's module;
 // - missimp: an import no DLL exports, bound to a stub (listed at the
 //   link): the program runs, and a call of it ends the process as Wine's
 //   stubs do;

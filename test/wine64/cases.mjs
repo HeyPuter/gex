@@ -248,6 +248,18 @@ export async function gexccWin(t, w, o = {}, pre = '', only = null) {
       `  printf("bigrelocs %llu\\n", t); return 0; }\n`);
     await one('bigrelocs', src, ['-O1'], { want: new RegExp(`bigrelocs ${sum}\\b`) });
   }
+  if (want('bigdata')) {
+    // more data than the PE data window of builtins with data exports
+    // holds (16 MiB in the compact space): its ends written, read back and
+    // the program's own module
+    const src = join(w.work, 'bigdata.c');
+    writeFileSync(src, '#include <windows.h>\n#include <stdio.h>\nstatic char big[24 << 20];\nint lit[4] = {1, 2, 3, 4};\n' +
+      'static int of(const void *p) { HMODULE h = 0; return GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | ' +
+      'GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, p, &h) && h == GetModuleHandleW(NULL); }\n' +
+      'int main(void) { big[0] = 7; big[sizeof big - 1] = 9; int ok = big[0] == 7 && big[sizeof big - 1] == 9 && lit[3] == 4;\n' +
+      '  printf("bigdata: ends %d module %d %d\\n", ok, of(big), of(big + sizeof big - 1)); return 0; }\n');
+    await one('bigdata', src, ['-O1'], { want: /bigdata: ends 1 module 1 1/ });
+  }
   await one('hostdatacc', join(W, 'hostdata.c'), ['-O2']);
   if (want('wmain0')) {
     // wmain(void) compiled and linked in one step
