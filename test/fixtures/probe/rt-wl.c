@@ -2,7 +2,7 @@
  * solid colour, titled from argv, that says on stdout what it hears.
  *
  *   rt-wl TITLE [maximize] [minimize] [move] [lock] [copy TEXT] [paste] [app ID]
- *         [size W H] [colour RRGGBB] [place X Y LAYER [bottom]]
+ *         [size W H] [colour RRGGBB] [place X Y LAYER [bottom] [grab]]
  *
  * "drawn W H" for each frame, "configure W H STATES" for each configure
  * (STATES: m maximized, f fullscreen, r resizing, a activated), "focus" when
@@ -18,8 +18,10 @@
  * says "paste TEXT". "size" and "colour" set its buffer. With "place", it
  * is placed (gex_window_placement_v1, unmanaged) at X,Y in layer LAYER (0
  * normal, 1 topmost, 2 overlay, 3 desktop), its stack id its pid, and with
- * "bottom" sent to the bottom of its layer after its first frame; it says
- * "pressed X Y" with each press, in surface coordinates. The compositor's
+ * "bottom" sent to the bottom of its layer after its first frame, and with
+ * "grab" it grabs the pointer then (version 4: every pointer event is its,
+ * wherever the pointer is); it says "pressed X Y" with each press, in
+ * surface coordinates (outside it, under a grab). The compositor's
  * close ends it with 0.
  *
  * xdg-shell's interfaces are written out here (version 1), as
@@ -122,7 +124,7 @@ static int width = 200, height = 100, want_w, want_h, running = 1, move_on_press
 static const char *app_id;
 static uint32_t colour = 0xff3060c0;
 
-/* -- gex_window_placement_v1, version 3 ------------------------------------ */
+/* -- gex_window_placement_v1, version 4 ------------------------------------ */
 
 extern const struct wl_interface gex_window_placement_v1_interface;
 static const struct wl_interface *place_types[] = {&gex_window_placement_v1_interface, &wl_surface_interface, NULL, NULL};
@@ -130,7 +132,7 @@ static const struct wl_message place_manager_requests[] = {
     {"destroy", "", place_types + 2},
     {"get_placement", "no", place_types},
 };
-static const struct wl_interface place_manager_interface = {"gex_window_placement_manager_v1", 3, 2, place_manager_requests, 0, NULL};
+static const struct wl_interface place_manager_interface = {"gex_window_placement_manager_v1", 4, 2, place_manager_requests, 0, NULL};
 static const struct wl_message placement_requests[] = {
     {"destroy", "", place_types + 2},
     {"set_position", "ii", place_types + 2},
@@ -139,11 +141,14 @@ static const struct wl_message placement_requests[] = {
     {"place_below", "u", place_types + 2},
     {"set_unmanaged", "", place_types + 2},
     {"activate", "", place_types + 2},
+    {"grab", "4", place_types + 2},
+    {"release_grab", "4", place_types + 2},
 };
 static const struct wl_message placement_events[] = {{"origin", "2ii", place_types + 2}};
-const struct wl_interface gex_window_placement_v1_interface = {"gex_window_placement_v1", 3, 7, placement_requests, 1, placement_events};
+const struct wl_interface gex_window_placement_v1_interface = {"gex_window_placement_v1", 4, 9, placement_requests, 1, placement_events};
 static struct wl_proxy *place_manager, *placement;
-static int place, place_x, place_y, place_bottom, drawn_once;
+static int place, place_x, place_y, place_bottom, place_grab, drawn_once;
+static uint32_t place_version;
 static uint32_t place_layer;
 static void placement_origin(void *d, struct wl_proxy *pl, int32_t x, int32_t y) {
   (void)d; (void)pl; (void)x; (void)y;
@@ -179,6 +184,7 @@ static void draw(void) {
   wl_surface_damage(surface, 0, 0, width, height);
   wl_surface_commit(surface);
   if (placement && place_bottom && !drawn_once) wl_proxy_marshal(placement, 4, 0xffffffffu);
+  if (placement && place_grab && place_version >= 4 && !drawn_once) wl_proxy_marshal(placement, 7);
   drawn_once = 1;
   say("drawn %d %d\n", width, height);
 }
@@ -428,7 +434,8 @@ static void global(void *d, struct wl_registry *r, uint32_t name, const char *if
   } else if (!strcmp(iface, "zwp_relative_pointer_manager_v1")) {
     rel_manager = wl_registry_bind(r, name, &zwp_relative_pointer_manager_v1_interface, 1);
   } else if (!strcmp(iface, "gex_window_placement_manager_v1") && v >= 3) {
-    place_manager = wl_registry_bind(r, name, &place_manager_interface, 3);
+    place_version = v < 4 ? v : 4;
+    place_manager = wl_registry_bind(r, name, &place_manager_interface, place_version);
   } else if (!strcmp(iface, "zwp_pointer_constraints_v1")) {
     constraints = wl_registry_bind(r, name, &zwp_pointer_constraints_v1_interface, 1);
   }
@@ -458,6 +465,7 @@ int main(int argc, char **argv) {
       place_y = atoi(argv[++i]);
       place_layer = (uint32_t)atoi(argv[++i]);
     } else if (!strcmp(argv[i], "bottom")) place_bottom = 1;
+    else if (!strcmp(argv[i], "grab")) place_grab = 1;
   }
   struct wl_display *dpy = wl_display_connect(NULL);
   if (!dpy) {

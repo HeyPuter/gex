@@ -3,7 +3,9 @@
 // desktop layer (3) -- and a 200x100 window at 100,100 in the normal layer,
 // sent to the bottom of its layer after its first frame. The window must show
 // over the desktop, the desktop around it, and a press over each must reach
-// its own program. `where`: the output's rectangle on the page.
+// its own program. Then a third, at 300,300, grabs the pointer (version 4,
+// a Win32 menu's grab): a press over the desktop reaches it instead, outside
+// it, until it is gone. `where`: the output's rectangle on the page.
 
 const DESK = [0x20, 0x40, 0x60];
 const WIN = [0x30, 0x60, 0xc0];
@@ -46,6 +48,15 @@ export async function desktopLayer(t, sys, out, where) {
   };
   await press(500, 400, deskSaid, [500, 400], 'a press over the bare desktop reaches the desktop');
   await press(150, 150, winSaid, [50, 50], 'a press over the window reaches the window');
+  const grab = sys.spawn(['rt-wl', 'grab', 'place', '300', '300', '0', 'grab'], { env });
+  const grabSaid = lines(grab);
+  await until(() => grabSaid.some((l) => l.startsWith('drawn')), 'the grabbing window drawn', 60000)
+    .catch((e) => { throw new Error(`${e.message}: ${JSON.stringify(grabSaid)}`); });
+  await press(500, 400, grabSaid, [200, 100], 'under a grab, a press over the desktop reaches the grabbing window');
+  await press(150, 150, grabSaid, [-150, -150], 'and one over the other window');
+  grab.kill('SIGKILL');
+  await new Promise((r) => setTimeout(r, 1000));
+  await press(500, 400, deskSaid, [500, 400], 'the grab gone with its window, a press over the desktop reaches the desktop');
   desk.kill('SIGKILL');
   win.kill('SIGKILL');
   await sys.shutdown();

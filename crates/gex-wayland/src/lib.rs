@@ -346,6 +346,9 @@ pub struct Placement {
     pub restack: u32,
     /// Bumped by every activate request: give this surface the keyboard.
     pub activate: u32,
+    /// The client grabbed the pointer for this surface (version 4): every
+    /// pointer event is its, wherever the pointer is, until it lets go.
+    pub grab: bool,
 }
 
 impl Placement {
@@ -362,10 +365,11 @@ impl Placement {
     }
 
     /// The placement words of a surface record (`R_PLACE`.. in
-    /// `wl-bridge.mjs`): flags and layer, id, below, restack, activate.
+    /// `wl-bridge.mjs`): flags (placed, unmanaged, grab) and layer, id, below,
+    /// restack, activate.
     pub fn record_words(&self) -> [i32; 5] {
         [
-            i32::from(self.placed) | (i32::from(self.unmanaged) << 1) | ((self.layer as i32 & 0xff) << 8),
+            i32::from(self.placed) | (i32::from(self.unmanaged) << 1) | (i32::from(self.grab) << 2) | ((self.layer as i32 & 0xff) << 8),
             self.id as i32,
             self.below as i32,
             self.restack as i32,
@@ -586,8 +590,9 @@ const GLOBALS: &[(&str, u32)] = &[
     // cascading it. See `protocols/gex-window-placement-v1.xml`. Version 2
     // adds the `origin` event: where the compositor has the surface, for
     // turning its surface-local pointer positions into Win32's; version 3
-    // the desktop layer, under every other window.
-    ("gex_window_placement_manager_v1", 3),
+    // the desktop layer, under every other window; version 4 the grab, every
+    // pointer event to one surface while its client's menu or move loop runs.
+    ("gex_window_placement_manager_v1", 4),
     // Mouse look: a lock the host grants (the page's pointer lock) and the
     // movement under it (pointer.rs). Xwayland locks for an X client that
     // grabs the pointer and hides it.
@@ -1383,7 +1388,7 @@ impl Client {
             }
             "gex_window_placement_manager_v1" => {
                 self.objects.insert(id, Object::PlacementManager);
-                self.placement_version = version.min(3);
+                self.placement_version = version.min(4);
             }
             "zwp_relative_pointer_manager_v1" => {
                 self.objects.insert(id, Object::RelativePointerManager);
@@ -2697,6 +2702,15 @@ impl Client {
             5 => apply(self, &mut |s| s.placement.unmanaged = true),
             // activate
             6 => apply(self, &mut |s| s.placement.activate = s.placement.activate.wrapping_add(1)),
+            // grab, release_grab (version 4): one surface of the session has
+            // the grab, which the host picks out of the scene (the last made)
+            7 if self.placement_version >= 4 => {
+                for s in self.surfaces.values_mut() {
+                    s.placement.grab = false;
+                }
+                apply(self, &mut |s| s.placement.grab = true)
+            }
+            8 if self.placement_version >= 4 => apply(self, &mut |s| s.placement.grab = false),
             _ => ok = false,
         }
         ok
@@ -4205,6 +4219,37 @@ mod tests {
             assert!(c.failed.is_none(), "{:?}", c.failed);
             let p = c.scene()[0].placement;
             assert_eq!((p.layer, p.rank() < 0), (want, version == 3), "version {version}");
+        }
+    }
+
+    /// A grab (version 4) is the surface's until it lets go or its placement
+    /// goes, rides in the record's flags, and is refused to an older client.
+    #[test]
+    fn a_grab_needs_version_4_and_ends_with_release_or_destroy() {
+        let pool = Placed(0x6000, 8192);
+        for version in [4, 3] {
+            let (mut c, _) = placed_window(64, 32, 256);
+            c.receive(
+                &Writer::new(2, 0).uint(10).string("gex_window_placement_manager_v1").uint(version).new_id(59).finish(),
+                &[],
+                &pool,
+            );
+            c.receive(&Writer::new(59, 1).new_id(60).object(6).finish(), &[], &pool);
+            c.receive(&Writer::new(60, 7).finish(), &[], &pool);
+            c.receive(&Writer::new(6, 6).finish(), &[], &pool);
+            if version < 4 {
+                assert!(c.failed.is_some(), "a version 3 client's grab is not a request it has");
+                continue;
+            }
+            assert!(c.failed.is_none(), "{:?}", c.failed);
+            let p = c.scene()[0].placement;
+            assert!(p.grab);
+            assert_eq!(p.record_words()[0] & 4, 4);
+            c.receive(&Writer::new(60, 8).finish(), &[], &pool);
+            assert!(!c.scene()[0].placement.grab, "released");
+            c.receive(&Writer::new(60, 7).finish(), &[], &pool);
+            c.receive(&Writer::new(60, 0).finish(), &[], &pool);
+            assert!(!c.scene()[0].placement.grab, "gone with its placement");
         }
     }
 

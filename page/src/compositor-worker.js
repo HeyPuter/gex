@@ -884,6 +884,7 @@ class Compositor {
       }
       win.placed = s.placed;
       win.unmanaged = s.unmanaged;
+      win.grabbing = s.placed && s.grab;
       win.layer = s.layer;
       win.stackId = s.stackId;
       if (s.placed) {
@@ -1684,6 +1685,34 @@ class Compositor {
     sendEvent(this.#channel, win.block, EV_POINTER_CLEAR, 0, 0, 0, 0, win.client, 0);
   }
 
+  /** The placed window whose client grabbed the pointer (a Win32 menu or move
+   *  loop: gex_window_placement_v1.grab, as an X server grab), the topmost
+   *  when several say so: every pointer event is its, wherever the pointer
+   *  is, so a click on another program's window or the desktop reaches the
+   *  loop and ends it (the menu closes) rather than leaving it open. */
+  #clientGrab() {
+    const stack = this.#stack();
+    for (let i = stack.length - 1; i >= 0; i--) {
+      const win = this.#windows.get(stack[i]);
+      if (win?.grabbing) return { key: stack[i], win };
+    }
+    return null;
+  }
+
+  /** The pointer's place, to the grabbing window: it leaves whatever else had it. */
+  #toGrab(g, time) {
+    const { key, win } = g;
+    if (this.#pointer.over && this.#pointer.over !== key) {
+      const prev = this.#windows.get(this.#pointer.over);
+      if (prev && (prev.token !== win.token || prev.client !== win.client)) this.#leave(this.#pointer.over);
+    }
+    this.#pointer.over = key;
+    const at = this.#placeOf(win);
+    const k = win.cs || 1;
+    sendEvent(this.#channel, win.block, EV_MOTION, Math.floor((this.#pointer.x - at.x) / k), Math.floor((this.#pointer.y - at.y) / k),
+      time, 0, win.client, win.surface);
+  }
+
   pointerMove(x, y, time) {
     // Direct present: the page's coordinates are the GL frame's pixels.
     if (this.#direct) {
@@ -1694,6 +1723,11 @@ class Compositor {
     this.#pointer.y = y;
     if (this.#resize) {
       this.#resizeTo(x, y, false);
+      return;
+    }
+    const cg = this.#clientGrab();
+    if (cg) {
+      this.#toGrab(cg, time);
       return;
     }
     // A button held on a placed window: the motion is that window's, inside
@@ -1755,6 +1789,14 @@ class Compositor {
     this.#pointer.buttons = pressed
       ? this.#pointer.buttons | 1
       : this.#pointer.buttons & ~1;
+    const cg = !this.#resize && !this.#drag ? this.#clientGrab() : null;
+    if (cg) {
+      // at the pointer's place: the grab may have begun since its last motion
+      if (pressed) this.#toGrab(cg, time);
+      sendEvent(this.#channel, cg.win.block, EV_BUTTON, button, pressed ? 1 : 0, time, 0, cg.win.client, cg.win.surface);
+      if (!this.#pointer.buttons) this.#grab = null;
+      return;
+    }
     if (!pressed && this.#resize) {
       this.#resizeTo(this.#pointer.x, this.#pointer.y, true);
       this.#resize = null;
@@ -1845,6 +1887,11 @@ class Compositor {
   }
 
   pointerAxis(axis, value, time) {
+    const cg = this.#clientGrab();
+    if (cg) {
+      sendEvent(this.#channel, cg.win.block, EV_AXIS, axis, value, time, 0, cg.win.client, cg.win.surface);
+      return;
+    }
     const hit = this.#hit(this.#pointer.x, this.#pointer.y);
     if (!hit || hit.part !== 'content') return;
     sendEvent(this.#channel, hit.win.block, EV_AXIS, axis, value, time, 0, hit.win.client,

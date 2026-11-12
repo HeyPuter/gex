@@ -108,6 +108,8 @@ export const R_ADDR_HI = 37;
 export const recordAddr = (a, r) => (a[r + R_ADDR] >>> 0) + (a[r + R_ADDR_HI] >>> 0) * 0x100000000;
 export const P_PLACED = 1;
 export const P_UNMANAGED = 2;
+/** The client grabbed the pointer for the surface (placement version 4): every pointer event is its. */
+export const P_GRAB = 4;
 
 /** Roles, as `gex_wayland::Role::code` writes them. */
 export const ROLE_TOPLEVEL = 1;
@@ -446,6 +448,7 @@ export function readScene(channel, { onlyChanged = false } = {}) {
         pid: a[r + R_PID] >>> 0,
         placed: (a[r + R_PLACE] & P_PLACED) !== 0,
         unmanaged: (a[r + R_PLACE] & P_UNMANAGED) !== 0,
+        grab: (a[r + R_PLACE] & P_GRAB) !== 0,
         layer: (a[r + R_PLACE] >> 8) & 0xff,
         stackId: a[r + R_STACK_ID] >>> 0,
         below: a[r + R_STACK_BELOW] >>> 0,

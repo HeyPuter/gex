@@ -797,6 +797,7 @@ export class DomDesktop {
     // A popup, a subsurface or an X menu is placed by its client, not by the
     // page: say where it asked to be.
     win.placed = !!s.placed;
+    win.grabbing = !!s.placed && !!s.grab;
     win.layer = s.layer || 0;
     win.stackId = s.stackId || 0;
     if ((s.role !== ROLE_TOPLEVEL || s.placed) && (s.relX !== win.relX || s.relY !== win.relY)) {
@@ -985,8 +986,28 @@ export class DomDesktop {
     }
   }
 
+  /** The placed window whose client grabbed the pointer (a Win32 menu or
+   *  move loop: gex_window_placement_v1.grab, as an X server grab), or null. */
+  #grabber() {
+    for (const w of this.#windows.values()) if (w.grabbing && w.canvas) return w;
+    return null;
+  }
+
+  /** A pointer event on another window's canvas while `g` has the grab: it is
+   *  `g`'s, at the pointer's place relative to `g` (outside it, often), so a
+   *  click on another program's window or the desktop reaches the menu loop,
+   *  which ends it rather than leaving the menu open over that window. */
+  #toGrabber(g, e, pressed) {
+    const r = g.canvas.getBoundingClientRect();
+    const t = Math.round(e.timeStamp);
+    sendEvent(this.#channel, g.block, EV_MOTION, Math.round(e.clientX - r.left), Math.round(e.clientY - r.top), t, 0, g.client, g.surface);
+    const code = BTN[e.button];
+    if (pressed !== undefined && code !== undefined) sendEvent(this.#channel, g.block, EV_BUTTON, code, pressed ? 1 : 0, t, 0, g.client, g.surface);
+  }
+
   #attach(win) {
     const c = win.canvas;
+    const grabbed = () => { const g = this.#grabber(); return g && g !== win ? g : null; };
     // Inside the window, except for a placed window while a button holds the
     // pointer (Wayland's implicit grab): Wine's own move and size loops
     // (SC_MOVE, SC_SIZE) follow the pointer past the window's edge.
@@ -1000,6 +1021,8 @@ export class DomDesktop {
       };
     };
     c.addEventListener('pointerenter', (e) => {
+      const g = grabbed();
+      if (g) { this.#toGrabber(g, e); return; }
       this.#pointerOver = win;
       const p = at(e);
       sendEvent(this.#channel, win.block, EV_MOTION, p.x, p.y, p.t, 0,
@@ -1025,6 +1048,8 @@ export class DomDesktop {
                 p.t, 0, win.client, win.surface);
     };
     c.addEventListener('pointermove', (e) => {
+      const g = grabbed();
+      if (g) { this.#toGrabber(g, e, e.button >= 0 ? (e.buttons & (BIT[e.button] ?? 0)) !== 0 : undefined); return; }
       // Locked: movement only, which the client's relative pointer takes.
       if (this.#locked === win) {
         if (e.movementX || e.movementY) {
@@ -1040,6 +1065,8 @@ export class DomDesktop {
       if (e.button >= 0) button(e, (e.buttons & (BIT[e.button] ?? 0)) !== 0, p);
     });
     c.addEventListener('pointerdown', (e) => {
+      const g = grabbed();
+      if (g) { this.#toGrabber(g, e, true); return; }
       this.#pressed = win;
       if (this.#locked === win) {
         button(e, true, { t: Math.round(e.timeStamp) });
@@ -1058,6 +1085,8 @@ export class DomDesktop {
       button(e, true, p);
     });
     c.addEventListener('pointerup', (e) => {
+      const g = grabbed();
+      if (g && !held.size) { this.#toGrabber(g, e, false); return; }
       const p = at(e);
       try { c.releasePointerCapture?.(e.pointerId); } catch { /* never held */ }
       button(e, false, p);

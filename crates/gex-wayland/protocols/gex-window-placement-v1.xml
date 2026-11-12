@@ -22,7 +22,7 @@
     same space the client's own window system uses for a single screen.
   </description>
 
-  <interface name="gex_window_placement_manager_v1" version="3">
+  <interface name="gex_window_placement_manager_v1" version="4">
     <request name="destroy" type="destructor">
       <description summary="destroy the manager">
         Placement objects already made are unaffected.
@@ -40,7 +40,7 @@
     </request>
   </interface>
 
-  <interface name="gex_window_placement_v1" version="3">
+  <interface name="gex_window_placement_v1" version="4">
     <enum name="layer">
       <entry name="normal" value="0"/>
       <entry name="topmost" value="1" summary="above every normal window"/>
@@ -103,6 +103,26 @@
       </description>
     </request>
 
+    <request name="grab" since="4">
+      <description summary="take every pointer event, wherever the pointer is">
+        The client's window system captured the pointer for a modal loop --
+        a menu, a window move or size -- as an X server grab does: until
+        release_grab, every pointer event of the seat (enter, motion,
+        buttons, axes) goes to this surface, whatever is under the pointer,
+        including other clients' surfaces. Positions are surface-local as
+        ever, relative to the origin, and lie outside the surface when the
+        pointer does. A click outside the client's windows then reaches it,
+        and it can close its menu, as it would on its own window system.
+        The grab ends with release_grab, the placement object's destroy or
+        the surface's. A grab by one surface replaces any other.
+      </description>
+    </request>
+    <request name="release_grab" since="4">
+      <description summary="end this surface's grab">
+        Pointer events go to whatever is under the pointer again, from the
+        next one on. Nothing happens when the surface has no grab.
+      </description>
+    </request>
     <event name="origin" since="2">
       <description summary="where the compositor shows the surface">
         The position, in output pixels, of the surface's top-left corner as
