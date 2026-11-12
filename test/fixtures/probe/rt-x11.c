@@ -1,6 +1,7 @@
 /* An X11 window for the runtime's window tests, through the page's X server:
  * one window of a solid colour, titled from argv, that says on stdout what
- * it hears: "mapped", "key KEYCODE" for each key pressed, "button N" for
+ * it hears: "mapped", "key KEYCODE" for each key pressed and "release
+ * KEYCODE" for each released, "button N" for
  * each button pressed, and "close" when
  * the window manager asks it to close (WM_DELETE_WINDOW), which ends it
  * with 0. Its WM_CLASS is "rt-x11", "RtX11" and its _NET_WM_PID its pid,
@@ -59,7 +60,7 @@ int main(int argc, char **argv) {
   Atom targets = XInternAtom(dpy, "TARGETS", False);
   Atom prop = XInternAtom(dpy, "RT_PASTE", False);
   XSetWMProtocols(dpy, w, &del, 1);
-  XSelectInput(dpy, w, ExposureMask | KeyPressMask | StructureNotifyMask | ButtonPressMask | PointerMotionMask);
+  XSelectInput(dpy, w, ExposureMask | KeyPressMask | KeyReleaseMask | StructureNotifyMask | ButtonPressMask | PointerMotionMask);
   if (where) {
     XSelectInput(dpy, RootWindow(dpy, scr), StructureNotifyMask);
     printf("root %d %d\n", DisplayWidth(dpy, scr), DisplayHeight(dpy, scr));
@@ -84,6 +85,8 @@ int main(int argc, char **argv) {
       printf("at %d %d %d %d\n", x, y, e.xconfigure.width, e.xconfigure.height);
     } else if (e.type == KeyPress) {
       printf("key %u\n", e.xkey.keycode);
+    } else if (e.type == KeyRelease) {
+      printf("release %u\n", e.xkey.keycode);
     } else if (e.type == ButtonPress) {
       printf("button %u\n", e.xbutton.button);
       if (at) printf("press %u at %d %d\n", e.xbutton.button, e.xbutton.x, e.xbutton.y);

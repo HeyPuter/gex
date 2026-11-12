@@ -1124,6 +1124,8 @@ impl HostListener for WaylandDevice {
         let (w, h) = output_size();
         client.set_default_size(w, h);
         client.set_scale(OUTPUT_SCALE.load(std::sync::atomic::Ordering::Relaxed));
+        // the browser repeats a held key itself (keydowns with `repeat`)
+        client.set_key_repeat(0, 600);
         let idx = {
             let mut n = self.inner.next_idx.lock().unwrap();
             *n += 1;

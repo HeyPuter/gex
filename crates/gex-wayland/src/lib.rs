@@ -849,6 +849,9 @@ pub struct Client {
     /// Device pixels per surface unit: what `wl_output.scale` says. A
     /// toplevel's configure is in surface units, so `default_size / scale`.
     scale: i32,
+    /// `wl_keyboard.repeat_info`: keys a second and the delay in ms (rate 0:
+    /// the client repeats nothing, the host sends each repeat as a press).
+    key_repeat: (i32, i32),
     /// The version this client bound `xdg_wm_base` at, which its toplevels
     /// share: `configure_bounds` is only for 4 and up.
     wm_base_version: u32,
@@ -938,6 +941,7 @@ impl Client {
             default_size: (640, 480),
             fullscreen_changes: Vec::new(),
             scale: 1,
+            key_repeat: (25, 600),
             wm_base_version: 0,
             placement_version: 0,
             positioners: HashMap::new(),
@@ -1011,6 +1015,17 @@ impl Client {
     /// the client binds the output.
     pub fn set_scale(&mut self, scale: i32) {
         self.scale = scale.clamp(1, 8);
+    }
+
+    /// The key repeat this client is told (`wl_keyboard.repeat_info`): `rate`
+    /// keys a second after `delay` ms, or none at rate 0. A host whose input
+    /// already repeats (a browser's keydowns while a key is held) says 0 and
+    /// sends each repeat as a press: a repeat timer in the client runs from
+    /// the press it saw, and when the host is late handing on the release
+    /// (a page's main thread busy) it repeats a key the user let go of.
+    /// Set before the client asks for its keyboard.
+    pub fn set_key_repeat(&mut self, rate: i32, delay: i32) {
+        self.key_repeat = (rate.max(0), delay.max(0));
     }
 
     /// Feed bytes and descriptors that arrived together.
@@ -2744,8 +2759,8 @@ impl Client {
                 self.send(w);
                 self.pending_keymap = Some(km);
                 // repeat_info(rate keys/s, delay ms) for v4+, so the client does
-                // not have to assume a repeat rate.
-                let w = Writer::new(id, 5).int(25).int(600);
+                // not have to assume a repeat rate (`set_key_repeat`).
+                let w = Writer::new(id, 5).int(self.key_repeat.0).int(self.key_repeat.1);
                 self.send(w);
                 true
             }
@@ -3687,6 +3702,26 @@ mod tests {
         assert_eq!(r.uint(), Some(300), "time");
         assert_eq!(r.uint(), Some(30), "key");
         assert_eq!(r.uint(), Some(1), "pressed");
+    }
+
+    /// The repeat a keyboard is told: 25 a second after 600 ms by default; a
+    /// host that sends its own repeats as presses says rate 0 (none).
+    #[test]
+    fn a_keyboard_is_told_the_hosts_key_repeat() {
+        let rate = |set: Option<(i32, i32)>| {
+            let mut c = with_seat();
+            if let Some((r, d)) = set {
+                c.set_key_repeat(r, d);
+            }
+            c.receive(&Writer::new(12, 1).new_id(13).finish(), &[], &no_pool());
+            let msgs = messages(&c.take_outgoing());
+            let info = msgs.iter().find(|(o, op, _)| *o == 13 && *op == 5).expect("repeat_info");
+            let mut fds = Vec::new();
+            let mut r = Reader::new(&info.2, &mut fds);
+            (r.int().unwrap(), r.int().unwrap())
+        };
+        assert_eq!(rate(None), (25, 600));
+        assert_eq!(rate(Some((0, 600))), (0, 600));
     }
 
     /// A window that never commits a buffer (its pixels are the host's GL)

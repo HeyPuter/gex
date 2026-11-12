@@ -6,7 +6,8 @@
  *
  * "drawn W H" for each frame, "configure W H STATES" for each configure
  * (STATES: m maximized, f fullscreen, r resizing, a activated), "focus" when
- * it gets the keyboard, "key CODE" for each key pressed and "button" for
+ * it gets the keyboard, "repeat RATE DELAY" for the keyboard's repeat_info,
+ * "key CODE" for each key pressed and "button" for
  * each press. With "move", a press asks to be moved (xdg_toplevel.move), as
  * its own title bar would; with "maximize", to be maximized, and with
  * "minimize", minimized. "app ID" sets its app id. With "lock",
@@ -312,7 +313,8 @@ static void kb_mods(void *d, struct wl_keyboard *k, uint32_t s, uint32_t a, uint
   (void)d; (void)k; (void)s; (void)a; (void)b; (void)c; (void)g;
 }
 static void kb_repeat(void *d, struct wl_keyboard *k, int32_t r, int32_t de) {
-  (void)d; (void)k; (void)r; (void)de;
+  (void)d; (void)k;
+  say("repeat %d %d\n", r, de);
 }
 /* -- pointer constraints and relative pointer, version 1 ----------------- */
 

@@ -1,6 +1,10 @@
 // X programs through Xwayland: the clipboard both ways (the X window
-// manager's selection bridge) and a game's pointer grab (hidden cursor and
-// warps), which Xwayland turns into a locked pointer and relative motion.
+// manager's selection bridge), a game's pointer grab (hidden cursor and
+// warps), which Xwayland turns into a locked pointer and relative motion,
+// and the keyboard's repeat, which is the browser's: a key held while the
+// page's main thread is busy is one key (no repeat timer in Xwayland runs
+// on past a release the page has not handed on yet), and the browser's own
+// repeats while a key is held are presses, the release after them.
 import { System } from '../../page/runtime/src/index.js';
 import { MemoryFilesystem } from '../../page/runtime/src/fs.js';
 import { HostWindows } from '../../page/runtime/src/windows/host.js';
@@ -75,7 +79,36 @@ export default async function (t) {
     .catch((e) => { throw new Error(`${e.message}: ${JSON.stringify(game.out)}`); });
   check(`relative motion reaches the X program (${game.out.filter((l) => l.startsWith('look')).join(', ')})`, true);
   lock.release();
-  for (const x of [reader, writer, game]) x.p.kill();
-  await Promise.all([reader, writer, game].map((x) => x.p.exited));
+
+  // The keyboard's repeat. KEY_A is X keycode 38, KEY_B 56.
+  const keys = await start('xkeys');
+  await click(at.get(keys.w) + 20, 20);
+  const key = (type, code, autoRepeat = false) => input({ method: 'Input.dispatchKeyEvent', type, code, key: code.slice(3).toLowerCase(),
+    windowsVirtualKeyCode: code.charCodeAt(3), autoRepeat });
+  const of = (k) => keys.out.filter((l) => l === `key ${k}` || l === `release ${k}`);
+  await key('keyDown', 'KeyA');
+  // the page's main thread busy for 900 ms before the release is handed on
+  const end = performance.now() + 900;
+  while (performance.now() < end);
+  await key('keyUp', 'KeyA');
+  await until(() => of(38).includes('release 38'), 'the release of A', 10000)
+    .catch((e) => { throw new Error(`${e.message}: ${JSON.stringify(keys.out)}`); });
+  await new Promise((r) => setTimeout(r, 1000));
+  eq('a key held through a 900 ms stall is one key', of(38), ['key 38', 'release 38']);
+  await key('keyDown', 'KeyB');
+  for (let i = 0; i < 5; i++) {
+    await new Promise((r) => setTimeout(r, 50));
+    await key('keyDown', 'KeyB', true);
+  }
+  await key('keyUp', 'KeyB');
+  await until(() => of(56).at(-1) === 'release 56', 'the release of B', 10000)
+    .catch((e) => { throw new Error(`${e.message}: ${JSON.stringify(keys.out)}`); });
+  await new Promise((r) => setTimeout(r, 500));
+  const b = of(56);
+  eq('a held key repeats as the browser repeats it: 6 presses', b.filter((l) => l === 'key 56').length, 6);
+  eq('and its release comes after them', b.at(-1), 'release 56');
+
+  for (const x of [reader, writer, game, keys]) x.p.kill();
+  await Promise.all([reader, writer, game, keys].map((x) => x.p.exited));
   await sys.shutdown();
 }

@@ -50,6 +50,28 @@ export default async function (t) {
   await t.key('KeyA', 'a');
   await until(() => out.includes('key 30'), 'a key');
   check('a key reaches it', true);
+  // The browser repeats a held key, and the compositor passes each repeat on
+  // as a press: the client is told not to repeat itself (rate 0), so a
+  // release the page is late handing on (its main thread busy) repeats
+  // nothing. KEY_B is 48.
+  eq('the client is told the browser repeats keys (rate 0)', out.find((l) => l.startsWith('repeat ')), 'repeat 0 600');
+  const key = (type, autoRepeat = false) => t.input({ method: 'Input.dispatchKeyEvent', type, code: 'KeyB', key: 'b', windowsVirtualKeyCode: 66, autoRepeat });
+  const bs = () => out.filter((l) => l === 'key 48').length;
+  await key('keyDown');
+  const end = performance.now() + 900;
+  while (performance.now() < end);
+  await key('keyUp');
+  await until(() => bs() === 1, 'B');
+  await new Promise((r) => setTimeout(r, 500));
+  eq('a key held through a 900 ms stall is one press', bs(), 1);
+  await key('keyDown');
+  for (let i = 0; i < 5; i++) {
+    await new Promise((r) => setTimeout(r, 50));
+    await key('keyDown', true);
+  }
+  await key('keyUp');
+  await until(() => bs() === 7, 'the browser\'s repeats of B');
+  eq('a held key: its press and the browser\'s 5 repeats, 6 presses', bs() - 1, 6);
 
   const resized = new Promise((r) => w.addEventListener('resized', r, { once: true }));
   w.resize(300, 150);
