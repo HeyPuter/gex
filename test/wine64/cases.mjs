@@ -234,6 +234,19 @@ export async function gexccWin(t, w, o = {}, pre = '', only = null) {
         /Unimplemented function advapi32\.dll\.RegOpenKeyTransactedW called/.test(`${r.out}\n${r.err}`), w.detail(r));
     }
   }
+  if (want('bigrelocs')) {
+    // more addresses in data than one function of their relocations can
+    // apply within the engines' function size limit
+    const n = 480000;
+    const src = join(w.work, 'bigrelocs.c');
+    let sum = 0;
+    const ents = [];
+    for (let i = 0; i < n; i++) { ents.push(`s+${i & 0xffff}`); sum += i & 0xffff; }
+    writeFileSync(src, `#include <stdio.h>\nstatic char s[0x10000];\nchar *tab[${n}] = {${ents.join(',')}};\n` +
+      `int main(int argc, char **argv) { unsigned long long t = 0; for (int i = 0; i < ${n}; i++) t += (unsigned long long)(tab[i] - s);\n` +
+      `  printf("bigrelocs %llu\\n", t); return 0; }\n`);
+    await one('bigrelocs', src, ['-O1'], { want: new RegExp(`bigrelocs ${sum}\\b`) });
+  }
   await one('hostdatacc', join(W, 'hostdata.c'), ['-O2']);
   if (want('wmain0')) {
     // wmain(void) compiled and linked in one step

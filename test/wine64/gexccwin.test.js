@@ -15,6 +15,9 @@
 // - missimp: an import no DLL exports, bound to a stub (listed at the
 //   link): the program runs, and a call of it ends the process as Wine's
 //   stubs do;
+// - bigrelocs: more addresses in data than one function of their
+//   relocations applies within the engines' function size limit (pelink
+//   splits it);
 // - hostdatacc: hostdata.c's statics, gex's memory outside every image;
 // - wmain0, wmain3: wmain(void) and wmain(argc, argv, envp);
 // - xthr: a just-loaded DLL's function called by a thread with no system

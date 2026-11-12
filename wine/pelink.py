@@ -563,6 +563,127 @@ def dll_slots(path, mapfile, obj_dll):
     return ''.join(f'{dll} {kind} {lo:x} {hi:x}\n' for (dll, kind), rs in sorted(ranges.items()) for lo, hi in rs)
 
 
+# A function body over the engines' limit (7654321 bytes) fails the load:
+# wasm-ld's __wasm_apply_data_relocs, one store for each address in a large
+# program's data, passes it. Such a straight-line function is split.
+SPLIT_FUNC_AT = 1 << 20
+
+
+def split_big_funcs(path):
+    """Each function of a module that takes nothing and returns nothing, has
+    no locals and is a sequence of stores of constants, globals and their
+    sums over SPLIT_FUNC_AT bytes: its statements in functions of their
+    own, appended after the others (no index changes), which it calls."""
+    b = open(path, 'rb').read()
+    secs, i = [], 8
+    while i < len(b):
+        size, j = leb_at(b, i + 1)
+        secs.append([b[i], b[j:j + size]])
+        i = j + size
+    by = {sid: k for k, (sid, _) in enumerate(secs) if sid}
+    if 10 not in by or 3 not in by or 1 not in by:
+        return
+    def sleb_end(body, k):
+        while body[k] & 0x80:
+            k += 1
+        return k + 1
+    # the types taking and returning nothing
+    void, (n, k) = set(), leb_at(secs[by[1]][1], 0)
+    tb = secs[by[1]][1]
+    for t in range(n):
+        if tb[k] != 0x60:
+            return
+        np_, k = leb_at(tb, k + 1)
+        k += np_
+        nr, k = leb_at(tb, k)
+        k += nr
+        if not np_ and not nr:
+            void.add(t)
+    fb = secs[by[3]][1]
+    nf, k = leb_at(fb, 0)
+    ftypes = []
+    for _ in range(nf):
+        t, k = leb_at(fb, k)
+        ftypes.append(t)
+    cb = secs[by[10]][1]
+    nc, k = leb_at(cb, 0)
+    bodies = []
+    for _ in range(nc):
+        sz, k2 = leb_at(cb, k)
+        bodies.append(cb[k2:k2 + sz])
+        k = k2 + sz
+    nimp = 0
+    if 2 in by:
+        ib = secs[by[2]][1]
+        n, k = leb_at(ib, 0)
+        for _ in range(n):
+            for _ in range(2):
+                ln, k = leb_at(ib, k)
+                k += ln
+            kind = ib[k]
+            k += 1
+            if kind == 0:
+                nimp += 1
+                _, k = leb_at(ib, k)
+            elif kind in (1, 2):
+                k += kind == 1
+                fl, k = leb_at(ib, k)
+                _, k = leb_at(ib, k)
+                if fl & 1:
+                    _, k = leb_at(ib, k)
+            elif kind == 3:
+                k += 2
+            elif kind == 4:
+                k += 1
+                _, k = leb_at(ib, k)
+    # (stack effect of each opcode such a function may use)
+    PUSH = {0x23: 1, 0x41: 1, 0x42: 1}
+    BIN = {0x6a, 0x6b, 0x7c, 0x7d}
+    UN = {0xa7, 0xac, 0xad}
+    STORE = {0x36, 0x37}
+    new = []
+    for x, body in enumerate(bodies):
+        if len(body) <= SPLIT_FUNC_AT or ftypes[x] not in void or body[0] != 0:
+            continue
+        cuts, k, depth, ok = [1], 1, 0, True
+        while k < len(body) - 1:
+            op = body[k]
+            if op == 0x23:
+                _, k = leb_at(body, k + 1)
+            elif op in (0x41, 0x42):
+                k = sleb_end(body, k + 1)
+            elif op in BIN or op in UN:
+                k += 1
+            elif op in STORE:
+                _, k = leb_at(body, k + 1)
+                _, k = leb_at(body, k)
+            else:
+                ok = False
+                break
+            depth += PUSH.get(op, 0) - (op in BIN) - 2 * (op in STORE)
+            if depth == 0 and k - cuts[-1] >= SPLIT_FUNC_AT // 2:
+                cuts.append(k)
+        if not ok or depth or body[-1] != 0x0b:
+            continue
+        cuts.append(len(body) - 1)
+        calls = bytearray(b'\0')
+        for a, z in zip(cuts, cuts[1:]):
+            idx = nimp + nf + len(new)
+            new.append((ftypes[x], b'\0' + body[a:z] + b'\x0b'))
+            calls += b'\x10' + enc_leb(idx)
+        bodies[x] = bytes(calls) + b'\x0b'
+    if not new:
+        return
+    ftypes += [t for t, _ in new]
+    bodies += [bd for _, bd in new]
+    secs[by[3]][1] = enc_leb(len(ftypes)) + b''.join(enc_leb(t) for t in ftypes)
+    secs[by[10]][1] = enc_leb(len(bodies)) + b''.join(enc_leb(len(bd)) + bd for bd in bodies)
+    with open(path, 'wb') as f:
+        f.write(b[:8])
+        for sid, body in secs:
+            f.write(bytes([sid]) + enc_leb(len(body)) + body)
+
+
 def drop_custom(path, names):
     """A module without the custom sections `names` (link-time inputs only,
     which wasm-ld concatenates and wasm-opt keeps)."""
@@ -1711,6 +1832,7 @@ static void *gexw_ntdll_proc(const char *name)
         # (gexw.sig64, the ICALL pass's signatures: read from the defining
         # DLL's objects and side module at link time, never from the module)
         drop_custom(out, {'gexw.sig64'})
+        split_big_funcs(out)
         # The forwards, for gex to bind a -import re-export of a forwarded name
         # (kernel32's HeapFree is kernelbase's, which forwards to ntdll's
         # RtlFreeHeap): a custom section `gexw.forwards`, lines `name dll!target`.
