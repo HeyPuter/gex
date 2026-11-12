@@ -105,6 +105,31 @@ pub fn callout_live_sp(m: &GuestMem<'_>, ctx_addr: u64, alt: bool, wow64: bool, 
     alt.then(|| m.read_u64(ctx_addr + ctx::x(4) as u64).unwrap_or(0) & 0xffff_ffff)
 }
 
+/// The top of the stack a call-out whose caller's frame is at `sp_want` was
+/// made on: its thread's TEB's StackBase then (the 32-bit TEB's, FS, for
+/// `class32` code; else the 64-bit one's, GS). A stack pointer past
+/// `sp_want` and at most this has unwound past that caller; one above it is
+/// on another stack -- a fiber's, which has a stack of its own and the TEB
+/// names while it runs -- and says nothing about it. `u64::MAX` when the TEB
+/// names no stack holding `sp_want`.
+pub fn callout_stack_top(m: &GuestMem<'_>, ctx_addr: u64, class32: bool, sp_want: u64) -> u64 {
+    let range = if class32 {
+        let teb = m.read_u64(ctx_addr + ctx::FS_BASE as u64).unwrap_or(0) & 0xffff_ffff;
+        m.read_u32(teb + 4).ok().zip(m.read_u32(teb + 8).ok()).map(|(b, l)| (u64::from(b), u64::from(l)))
+    } else {
+        let teb = m.read_u64(ctx_addr + ctx::GS_BASE as u64).unwrap_or(0);
+        m.read_u64(teb + 8).ok().zip(m.read_u64(teb + 16).ok())
+    };
+    match range {
+        Some((base, limit)) if teb_names(base, limit, sp_want) => base,
+        _ => u64::MAX,
+    }
+}
+
+fn teb_names(base: u64, limit: u64, sp: u64) -> bool {
+    limit < base && sp >= limit && sp <= base
+}
+
 /// The operations [`SYSREG_X87`] carries (`gex_lift_x86::x87op`; the two
 /// must agree): an operation code in the low byte, operand fields above it.
 pub mod x87op {
@@ -1348,6 +1373,25 @@ mod tests {
         // switch): R14.
         regs(&mut m, 0x8000, 0x18000);
         assert_eq!(callout_live_sp(&m, CTX, false, true, false), Some(0x18000));
+    }
+
+    #[test]
+    fn a_call_out_is_unwound_past_only_on_its_own_stack() {
+        // 64-bit TEB at 0x2000 naming 0x10000..0x20000; 32-bit TEB at 0x3000
+        // naming 0x6000..0x9000.
+        let mut buf = vec![0u8; 0x4000];
+        let mut m = GuestMem::new(&mut buf);
+        m.write_u64(CTX + ctx::GS_BASE as u64, 0x2000).unwrap();
+        m.write_u64(0x2008, 0x20000).unwrap();
+        m.write_u64(0x2010, 0x10000).unwrap();
+        m.write_u64(CTX + ctx::FS_BASE as u64, 0x3000).unwrap();
+        m.write_u32(0x3004, 0x9000).unwrap();
+        m.write_u32(0x3008, 0x6000).unwrap();
+        assert_eq!(callout_stack_top(&m, CTX, false, 0x1f000), 0x20000);
+        assert_eq!(callout_stack_top(&m, CTX, true, 0x8000), 0x9000);
+        // a frame the TEB's stack does not hold: no bound
+        assert_eq!(callout_stack_top(&m, CTX, false, 0x30000), u64::MAX);
+        assert_eq!(callout_stack_top(&m, CTX, true, 0x1f000), u64::MAX);
     }
 
     #[test]

@@ -11484,7 +11484,7 @@ pub extern "C" fn gex_thread_park() -> i32 {
     IN_PROVIDER.with(|c| c.set(false));
     IN_SYSCALL.with(|c| c.set(false));
     NO_LEAVE.with(|c| c.set(false));
-    CALLOUT_GUARD.with(|c| c.set((0, false)));
+    CALLOUT_GUARD.with(|c| c.set((0, false, u64::MAX)));
     FAR_NEXT.with(|c| c.set((0, 0)));
     WOW64_WAITS.with(|c| c.set(0));
     SNAP_CARRY.with(|c| c.set(false));
@@ -16100,17 +16100,32 @@ pub extern "C" fn gex_sysreg_write(ctx: i32, pc: i64, reg: i32, val: i64) {
 
 thread_local! {
     /// The innermost open call-out of JavaScript's loops, as the stack
-    /// pointer past which its caller's frame is unwound and whether it was
-    /// made from code in the other mode (`gex_callout_guard`); 0 for none,
-    /// or one that wants no stack.
-    static CALLOUT_GUARD: std::cell::Cell<(u64, bool)> = const { std::cell::Cell::new((0, false)) };
+    /// pointer past which its caller's frame is unwound, whether it was
+    /// made from code in the other mode, and the top of the stack it was
+    /// made on (`gex_callout_guard`); a limit of 0 for none, or one that
+    /// wants no stack.
+    static CALLOUT_GUARD: std::cell::Cell<(u64, bool, u64)> = const { std::cell::Cell::new((0, false, u64::MAX)) };
 }
 
 /// JavaScript's innermost call-out (`gex.mjs` `#calloutGuard`): `limit` the
-/// stack pointer past which its caller is unwound, 0 for none.
+/// stack pointer past which its caller is unwound, 0 for none; `top` the
+/// top of its stack (`gex_callout_stack_top`), above which the stack is
+/// another fiber's.
 #[no_mangle]
-pub extern "C" fn gex_callout_guard(limit: i64, alt: i32) {
-    CALLOUT_GUARD.with(|g| g.set((limit as u64, alt != 0)));
+pub extern "C" fn gex_callout_guard(limit: i64, alt: i32, top: i64) {
+    CALLOUT_GUARD.with(|g| g.set((limit as u64, alt != 0, top as u64)));
+}
+
+/// The top of the stack a call-out made now in `alt` mode, its caller's
+/// frame at `sp_want`, is made on (`gex_kernel::x86::callout_stack_top`):
+/// -1 (no bound) for none known.
+#[no_mangle]
+pub extern "C" fn gex_callout_stack_top(ctx: i32, alt: i32, sp_want: i64) -> i64 {
+    if !gex_abi::X86 || sp_want == 0 {
+        return -1;
+    }
+    let class32 = gex_xlate::default_compat() != (alt != 0);
+    gex_kernel::x86::callout_stack_top(&guest(), ctx as u32 as u64, class32, sp_want as u64) as i64
 }
 
 /// Whether the stack of the thread at `ctx` has unwound past the caller of
@@ -16118,12 +16133,12 @@ pub extern "C" fn gex_callout_guard(limit: i64, alt: i32) {
 /// `NtCallbackReturn`'s): a change of mode then traps, and the call-out's
 /// loop leaves, as it did when every change of mode trapped.
 fn callout_unwound(ctx: i32) -> bool {
-    let (limit, alt) = CALLOUT_GUARD.with(|g| g.get());
+    let (limit, alt, top) = CALLOUT_GUARD.with(|g| g.get());
     if limit == 0 {
         return false;
     }
     let sp = gex_callout_live_sp(ctx, alt as i32);
-    sp != -1 && sp as u64 > limit
+    sp != -1 && sp as u64 > limit && sp as u64 <= top
 }
 
 thread_local! {

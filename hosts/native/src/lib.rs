@@ -5581,7 +5581,7 @@ fn register_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 // it: a whole trap-out and re-entry per safepoint on every
                 // thread but the main one (wined3d's command-stream thread
                 // spun at a crawl, and a game drew no frame).
-                if co.ret != 0 && sp.is_some_and(|sp| sp > co.sp_want + co.unwound) && !at_function() {
+                if co.ret != 0 && sp.is_some_and(|sp| co.left(sp)) && !at_function() {
                     if wasm_trace() {
                         eprintln!("gex: safepoint at {pc:#x} leaves the call-out to {:#x} (sp {:#x}, want {:#x})", co.ret, sp.unwrap_or(0), co.sp_want);
                     }
@@ -6294,10 +6294,21 @@ struct Callout {
     /// Made from code in the mode its process's class is not (`thread_alt`):
     /// a WoW64 process's 32-bit code, whose frames are on the 32-bit stack.
     alt: bool,
+    /// The top of the stack it was made on (`x86::callout_stack_top`): a
+    /// stack pointer above it is another fiber's, not past the caller.
+    stack_top: u64,
     /// `(slot, what the slot held)` while watched.
     slot: Option<(Slot, wasmtime::Ref)>,
     /// The slot holds the watch stub (an install may have written over it).
     live: bool,
+}
+
+impl Callout {
+    /// Whether the guest, at `sp`, has unwound past this call-out's caller:
+    /// above its frame on the stack it was made on.
+    fn left(&self, sp: u64) -> bool {
+        sp > self.sp_want.saturating_add(self.unwound) && sp <= self.stack_top
+    }
 }
 
 /// What the watch stub found when a dispatch reached a watched slot.
@@ -6368,7 +6379,7 @@ pub(crate) fn innermost_native_unwound(caller: &Caller<'_, HostState>, sp: u64) 
         .data()
         .callouts
         .last()
-        .is_some_and(|co| co.ret == gex_kernel::win::tramp::NATIVE_RETURN_PAD && sp > co.sp_want + co.unwound)
+        .is_some_and(|co| co.ret == gex_kernel::win::tramp::NATIVE_RETURN_PAD && co.left(sp))
 }
 
 /// The same for a guest call from native Wine (its return address is
@@ -7033,7 +7044,14 @@ fn call_out(caller: &mut Caller<'_, HostState>, ctx_i: i32, target: u64, ret: u6
         }
     }
     let alt = thread_alt(caller);
-    caller.data_mut().callouts.push(Callout { ret, sp_want, unwound, span, alt, slot: None, live: false });
+    // (a WoW64 stop's sp_want of 0 is on no stack and never unwound past)
+    let stack_top = if gex_abi::X86 && sp_want != 0 {
+        let class32 = gex_xlate::default_compat() != alt;
+        gex_kernel::x86::callout_stack_top(&GuestMem::new(memory.bytes()), ctx_addr, class32, sp_want)
+    } else {
+        u64::MAX
+    };
+    caller.data_mut().callouts.push(Callout { ret, sp_want, unwound, span, alt, stack_top, slot: None, live: false });
     let me = caller.data().callouts.len() - 1;
     refresh_callouts(&mut *caller)?;
     let mut next: Option<wasmtime::Func> = None;

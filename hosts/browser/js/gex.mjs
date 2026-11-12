@@ -7991,7 +7991,7 @@ export class Gex {
       if (e.gex_native_left?.()) {
         const c = this.#callouts.at(-1);
         const sp = this.#liveSp(Number(ctx), c);
-        if (c && this.#nest.at(-1)?.startsWith('callout') && c.ret === NATIVE_RETURN_PAD && sp > c.spWant + c.unwound) {
+        if (c && this.#nest.at(-1)?.startsWith('callout') && c.ret === NATIVE_RETURN_PAD && this.#left(c, sp)) {
           err.gexNativeLeft = true;
           throw err;
         }
@@ -9441,6 +9441,9 @@ export class Gex {
       c.span = c.unwound = (1n << 64n) - 1n;
       e.gex_wow64_waits?.(1);
     }
+    // The top of the stack it is made on: a stack pointer above it is
+    // another fiber's (a stack of its own), not past the caller (`#left`).
+    c.top = BigInt.asUintN(64, BigInt(e.gex_callout_stack_top?.(ctx, c.alt ? 1 : 0, BigInt.asIntN(64, c.spWant)) ?? -1));
     // Deep inside others, one more needs the host's stack to have room for
     // it: native Wine's guest calls hold their native frames, which no trap
     // drops, so the shim's count cannot bound them (the shim ends the
@@ -9564,7 +9567,7 @@ export class Gex {
           // frames): a native caller's call-out leaves, at the context's PC
           // (the entry the guest makes again); anything else carries on.
           if (err?.gexNativeLeft && c.ret === NATIVE_RETURN_PAD
-              && this.#liveSp(ctx, c) > c.spWant + c.unwound) { if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: native left`); return 0; }
+              && this.#left(c, this.#liveSp(ctx, c))) { if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: native left`); return 0; }
           // The process ended: down through every frame to the run loop
           // (returning would run the guest on).
           if (e.gex_exited?.()) {
@@ -9656,7 +9659,7 @@ export class Gex {
           // handled further out): its frame is gone, so it leaves. A call-out
           // that wants no stack (native Wine's thread loop) has no caller's
           // frame to unwind past.
-          if (c.spWant !== 0n && sp > c.spWant + c.unwound) {
+          if (c.spWant !== 0n && this.#left(c, sp)) {
             if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: unwound (sp ${sp.toString(16)}, resume ${pc.toString(16)})`);
             new DataView(this.#memory.buffer).setBigUint64(ctx + CTX_PC, pc, true);
             return 0;
@@ -9692,8 +9695,14 @@ export class Gex {
     const g = this.#shim.exports.gex_callout_guard;
     if (!g) return;
     const c = this.#callouts.at(-1);
-    if (!c || c.spWant === 0n) g(0n, 0);
-    else g(BigInt.asIntN(64, c.spWant + c.unwound), c.alt ? 1 : 0);
+    if (!c || c.spWant === 0n) g(0n, 0, -1n);
+    else g(BigInt.asIntN(64, c.spWant + c.unwound), c.alt ? 1 : 0, BigInt.asIntN(64, c.top));
+  }
+
+  /** Whether the guest, its stack pointer at `sp`, has unwound past call-out
+   *  `c`'s caller: above its frame on the stack it was made on. */
+  #left(c, sp) {
+    return sp > c.spWant + c.unwound && sp <= c.top;
   }
 
   /** The guest stack pointer's byte offset in a thread's context, which
