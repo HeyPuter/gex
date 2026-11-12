@@ -9,6 +9,8 @@
 // both ways, varargs and a file database. Every check's JSON must say ok in
 // both, all three libraries must be replaced in the second run and only
 // there, and the sqlite3 shell must print the same (bar .stats' memory lines).
+// First, the calling conventions' library (fixtures/native/native-libs/aconv.c,
+// build-aconv.sh): its program's checks must all pass, translated and replaced.
 //
 // Env (each a loud skip when unset): GEX_TEST_NATIVE_LIBS_ROOT (a Debian arm64
 // root with libz, libzstd, libsqlite3 and usr/bin/sqlite3), GEX_TEST_NATIVE_LIBS_SH
@@ -43,6 +45,25 @@ export default async function (t) {
     benv.A64_SYSROOT = join(d, 'a64libc/sysroot');
   }
   const O = join(d, 'out');
+  // The conventions (fixtures/native/native-libs/aconv.c): every AAPCS64
+  // shape through the library's exports and through its function pointers,
+  // and a callback, translated and with the library replaced.
+  {
+    const b = await exec([join(ROOT, 'test/fixtures/native/native-libs/build-aconv.sh'), O], { cwd: d, env: benv, timeout: 600000 });
+    if (t.check('build-aconv.sh', b.code === 0, tail(b.stdout + b.stderr))) {
+      for (const mode of ['translated', 'wasm']) {
+        const r = await n.g.run(seed, join(O, 'aconvt'), [], {
+          argv0: '/t/aconvt', merge: true, timeout: 300000,
+          flags: ['--dir', `/=${R}`, '--dir', `/lib=${join(R, 'usr/lib')}`],
+          files: { '/t/aconvt': join(O, 'aconvt'), '/t/libaconv.so.1': join(O, 'libaconv.so.1'), '/usr/lib/gex/aarch64/libaconv.so.1.wasm': join(O, 'libaconv.so.1.wasm') },
+          env: { GEX_SHARED: '1', GEX_LOG: '1', ...(mode === 'translated' ? { GEX_WASM_DLLS: 'noauto' } : {}) },
+        });
+        const all = r.all ?? '';
+        t.check(`aconv ${mode}: every check ok`, r.code === 0 && /^ok aconv: [0-9]+ checks\n0 failures$/m.test(all), `exit ${r.code}: ${tail(all, 8)}`);
+        t.check(`aconv ${mode}: libaconv.so.1 ${mode === 'wasm' ? 'replaced' : 'not replaced (noauto)'}`, all.includes('libaconv.so.1 replaced by') === (mode === 'wasm'));
+      }
+    }
+  }
   for (const b of ['build.sh', 'build-zstd.sh', 'build-sqlite.sh']) {
     const r = await exec([join(I3, b), O], { cwd: d, env: benv, timeout: 1800000 });
     if (!t.check(b, r.code === 0, tail(r.stdout + r.stderr))) return;
