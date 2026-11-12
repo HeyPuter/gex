@@ -12,7 +12,7 @@ a variadic export's adapter announces the guest's call to the export's
 va_start, and a va_list argument is the guest's (AAPCS64's).
 
   gen.py LIB [--gz] EXPORTS|- HEADER... > adapters.c
-  LIB: zlib, zstd or sqlite (which declaration macros mark an export)
+  LIB: zlib, zstd, sqlite or conv (which declaration macros mark an export)
 """
 import re, sys
 
@@ -25,6 +25,8 @@ DECL = {
     'zlib': r'ZEXTERN\s+([^;{]*?)\s*\bZEXPORT[VA]?\s+(\w+)\s*\(([^;{]*?)\)\s*;',
     'zstd': r'\b(?:ZSTDLIB_API|ZSTDLIB_STATIC_API|ZDICTLIB_API|ZDICTLIB_STATIC_API)\s+([^;{()]*?)\s*\b(\w+)\s*\(([^;{]*?)\)\s*;',
     'sqlite': r'\bSQLITE_API\s+([^;{()]*?)\s*\b(\w+)\s*\(([^;{]*?)\)\s*;',
+    # test/fixtures/native/native-libs/aconv.h, the conventions' test
+    'conv': r'\bCONV_API\s+([^;{()]*?)\s*\b(\w+)\s*\(([^;{]*?)\)\s*;',
 }[lib]
 varargs = lib == 'sqlite'
 protos, structs = {}, set()
@@ -130,8 +132,10 @@ for e in exports:
     if ret == 'void':
         print(f'\t{call};')
         print('\treturn a64_ret(ctx, ret, 0);')
-    elif re.fullmatch(r'(?:const\s+)?(?:double|float)', ret):
-        print(f'\treturn a64_ret_v(ctx, ret, (double){call});')
+    elif re.fullmatch(r'(?:const\s+)?float', ret):
+        print(f'\treturn a64_ret_s(ctx, ret, {call});')
+    elif re.fullmatch(r'(?:const\s+)?double', ret):
+        print(f'\treturn a64_ret_v(ctx, ret, {call});')
     elif is_struct(ret):
         print(f'\t{ret} r = {call};')
         print('\tif (sizeof r > 16) {')

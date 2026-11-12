@@ -56,15 +56,27 @@ static inline float a64_varg_float(int ctx, unsigned i, unsigned *k)
 	return f;
 }
 /* Return with a floating-point result in v0 (x0 as the guest left it). */
-static inline int a64_ret_v(int ctx, uint64_t ret, double d)
+static inline int a64_ret_v_bits(int ctx, uint64_t ret, uint64_t b)
 {
-	uint64_t b;
-	__builtin_memcpy(&b, &d, 8);
 	A64_V(ctx, 0) = b;
 	(((volatile uint64_t *)(uintptr_t)((uint32_t)(ctx) + a64_ctx_v()))[1]) = 0;
 	uint64_t ra = A64_X(ctx, 30);
 	A64_X(ctx, A64_PC) = ra;
 	return ra == ret;
+}
+static inline int a64_ret_v(int ctx, uint64_t ret, double d)
+{
+	uint64_t b;
+	__builtin_memcpy(&b, &d, 8);
+	return a64_ret_v_bits(ctx, ret, b);
+}
+
+/* The same for a float result: its bits in s0, v0's low word. */
+static inline int a64_ret_s(int ctx, uint64_t ret, float f)
+{
+	uint32_t b;
+	__builtin_memcpy(&b, &f, 4);
+	return a64_ret_v_bits(ctx, ret, b);
 }
 
 /* The calling thread's context and depth (tls.s), set on every entry. */
