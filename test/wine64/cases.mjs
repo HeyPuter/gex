@@ -262,6 +262,23 @@ export async function gexccWin(t, w, o = {}, pre = '', only = null) {
     await one('bigdata', src, ['-O1'], { want: /bigdata: ends 1 module 1 1/ });
   }
   await one('hostdatacc', join(W, 'hostdata.c'), ['-O2']);
+  if (want('modcase')) {
+    // installed under other case than its link (an installer naming the
+    // files ModCase.exe and ModCase.exe.wasm): its .wasmref still names
+    // modcase.exe.wasm, found as Windows finds files
+    const src = join(w.work, 'modcase.c');
+    writeFileSync(src, '#include <stdio.h>\nint main(int argc, char **argv) { printf("modcase ok\\n"); return 0; }\n');
+    let exe;
+    try { exe = await w.gexccWin(src, 'modcase.exe', ['-O1']); } catch (e) {
+      if (e instanceof Skip) throw e;
+      return t.check(`${pre}modcase: build`, false, String(e.message));
+    }
+    const dir = join(w.work, 'modcase-inst');
+    mkdirSync(dir, { recursive: true });
+    copyFileSync(exe, join(dir, 'ModCase.exe'));
+    copyFileSync(`${exe}.wasm`, join(dir, 'ModCase.exe.wasm'));
+    await w.nt({ ...o, name: `${pre}modcase`, exe: join(dir, 'ModCase.exe'), extra: [join(dir, 'ModCase.exe.wasm')], want: /modcase ok/ });
+  }
   if (want('wmain0')) {
     // wmain(void) compiled and linked in one step
     const w0 = join(w.work, 'wmain0.c');

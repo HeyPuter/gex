@@ -20,6 +20,10 @@
 // - fontset: IDWriteFontSet::GetMatchingFonts by family, weight, stretch
 //   and style, on the system set (Tahoma bold first when asked for bold)
 //   and on a set of a font file in memory;
+// - modcase: the program and its module installed under other case
+//   (ModCase.exe, ModCase.exe.wasm) than the name its .wasmref gives
+//   (modcase.exe.wasm): the module found without case, as Windows finds
+//   files;
 // - missimp: an import no DLL exports, bound to a stub (listed at the
 //   link): the program runs, and a call of it ends the process as Wine's
 //   stubs do;

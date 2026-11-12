@@ -60,6 +60,26 @@ pub fn read_guest_file(ns: &crate::vfs::Namespace, path: &str) -> Result<Vec<u8>
     Ok(v)
 }
 
+/// Whether two file names are the same to Windows, which compares names
+/// without case.
+pub fn same_name_nocase(a: &str, b: &str) -> bool {
+    a.chars().flat_map(char::to_uppercase).eq(b.chars().flat_map(char::to_uppercase))
+}
+
+/// The path of `name` in guest directory `dir` as Windows finds it: the
+/// entry whose name equals `name` but for case, when there is no exact one
+/// (an installer may have given a file other case than the name a program
+/// asks for).
+pub fn guest_file_nocase(ns: &crate::vfs::Namespace, dir: &str, name: &str) -> Option<String> {
+    let exact = format!("{dir}/{name}");
+    if ns.open(&exact, crate::fs::oflags::O_RDONLY, 0).is_ok() {
+        return Some(exact);
+    }
+    let d = ns.open(dir, crate::fs::oflags::O_RDONLY | crate::fs::oflags::O_DIRECTORY, 0).ok()?;
+    let e = d.read_dir().ok()?.into_iter().find(|e| same_name_nocase(&e.name, name))?;
+    Some(format!("{dir}/{}", e.name))
+}
+
 /// The trampolines at [`TRAMPOLINES`].
 pub mod tramp {
     use super::TRAMPOLINES;

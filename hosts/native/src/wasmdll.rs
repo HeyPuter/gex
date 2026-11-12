@@ -598,7 +598,19 @@ fn install_shared(
     // names a host path)
     let real = std::fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path));
     let beside = |name: &str| {
-        let file = real.with_file_name(name);
+        // found as Windows finds files, without case (the skeleton's
+        // .wasmref names the link's output; an installer may have given it
+        // other case)
+        let mut file = real.with_file_name(name);
+        if !file.exists() {
+            let dir = real.parent().map(std::path::Path::to_path_buf).unwrap_or_default();
+            let found = std::fs::read_dir(&dir).ok().and_then(|rd| {
+                rd.flatten().map(|e| e.file_name()).find(|n| n.to_str().is_some_and(|n| gex_kernel::win::same_name_nocase(n, name)))
+            });
+            if let Some(n) = found {
+                file = dir.join(n);
+            }
+        }
         // a twin install's memory64 module, beside it
         let twin = real.with_file_name(format!("{name}.m64"));
         if gex_abi::mem64() && twin.is_file() { twin } else { file }
