@@ -488,7 +488,8 @@ self.onmessage = ({ data: m }) => {
     if (aheadPaused) aheadAbort?.abort();
   }
   wakeAhead();
-  if (m.bundles?.length) aheadUrls = m.bundles;
+  // as a read names them (lazy-fetch.mjs: absolute), so the two share one index and the frames streamed
+  if (m.bundles?.length) aheadUrls = m.bundles.map((u) => { try { return new URL(u, here()).href; } catch { return u; } });
   if (!aheadPaused && aheadUrls.length) ahead(aheadUrls);
 };
 async function start(m) {

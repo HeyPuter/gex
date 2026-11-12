@@ -56,6 +56,8 @@ function bundle() {
 }
 const BASE = 'http://site.test/';
 const URL_BIN = `${BASE}rest.bin`;
+// the bundle as the page names it to the owner (app.js: a path on the origin), a read naming it whole
+const PAGE_BIN = '/rest.bin';
 const parseRange = (h) => {
   const m = /bytes=(\d+)-(\d+)/.exec(h ?? '');
   return m ? [Number(m[1]), Number(m[2])] : null;
@@ -96,7 +98,7 @@ if (isMainThread) {
   // -- paused, then not: one low request for all of it; reads after it, and a later visit, ask for nothing ----
   {
     const r = await run(20);
-    r.owner.postMessage({ kind: 'ahead', bundles: [URL_BIN], paused: true });
+    r.owner.postMessage({ kind: 'ahead', bundles: [PAGE_BIN], paused: true });
     await sleep(300);
     check(`paused: no request (${r.reqs().length})`, r.reqs().length === 0);
     r.owner.postMessage({ kind: 'ahead', paused: false });
@@ -112,7 +114,7 @@ if (isMainThread) {
     check(`reads of every frame after it: no request (${r.reqs().length - 1})`, r.reqs().length === 1);
     check('and the bytes right', got.every((n, k) => n === 100 && r.mem.subarray(4096 + k * 512, 4096 + k * 512 + 100).every((x, j) => x === want[k * FRAME + 5 + j])));
     r.msgs.length = 0;
-    r.owner.postMessage({ kind: 'ahead', bundles: [URL_BIN] });
+    r.owner.postMessage({ kind: 'ahead', bundles: [PAGE_BIN] });
     await until(() => doneMsg(r));
     const later = r.msgs.filter((m) => m.kind === 'rest').at(-1);
     check(`a later visit: no request (${r.reqs().length - 1}), nothing to download (${JSON.stringify(later)})`, r.reqs().length === 1 && later?.total === 0);
@@ -122,7 +124,7 @@ if (isMainThread) {
   // -- paused in the middle: stopped, then taken up from the first frame not held ------------------------
   {
     const r = await run(100);
-    r.owner.postMessage({ kind: 'ahead', bundles: [URL_BIN] });
+    r.owner.postMessage({ kind: 'ahead', bundles: [PAGE_BIN] });
     await until(() => r.msgs.some((m) => m.kind === 'rest' && m.done >= 2 * FRAME));
     r.owner.postMessage({ kind: 'ahead', paused: true });
     await sleep(400);
@@ -139,7 +141,7 @@ if (isMainThread) {
   // -- a read of a frame the download has not reached: its own request at once, not low ------------------
   {
     const r = await run(150);
-    r.owner.postMessage({ kind: 'ahead', bundles: [URL_BIN] });
+    r.owner.postMessage({ kind: 'ahead', bundles: [PAGE_BIN] });
     await sleep(60);
     const t0 = Date.now();
     const n = await r.read((NFRAMES - 1) * FRAME + 7, 50, 4096);
@@ -189,6 +191,7 @@ if (isMainThread) {
     return new Response(stream, { status: 206 });
   };
   globalThis.self = { postMessage: (m) => parentPort.postMessage(m) };
+  globalThis.GEX_BASE = BASE;
   await import(gexUrl('page/src/lazy-cache-worker.js'));
   parentPort.on('message', (data) => self.onmessage({ data }));
 } else {
