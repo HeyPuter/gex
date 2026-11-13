@@ -3,7 +3,9 @@
 // sys.sync() or the write-back's age sends it to the store with a generation
 // of the kept root (gex_kernel::vfs::tmpfs::persist), and each of those
 // flushes the store; a write of a MiB or more goes to the store at once; a
-// full store is ENOSPC, a failing one EIO. Seen from a
+// full store is ENOSPC, a failing one EIO. A process's exit writes a
+// generation too (core/fs-persist-exit), so what is to stay in the cache is
+// written by a shell that stays (its builtins: no child that ends). Seen from a
 // store of the page's own, which counts what reaches it. One system per page,
 // so each phase is a load of its own (t.reload).
 import { System } from '../../page/runtime/src/index.js';
@@ -59,6 +61,38 @@ async function sh(t, sys, cmd) {
   return { code: r.code, out: r.stdout + r.stderr };
 }
 
+/** A bash that stays for the whole phase: `run(cmd)` runs `cmd` in it and
+ *  gives its status and output. What its builtins (printf) write is written by
+ *  a process that has not ended. */
+function shell(sys) {
+  const p = sys.spawn(['bash'], { env: ENV });
+  p.stderr.pipeTo(new WritableStream()).catch(() => {});
+  const w = p.stdin.getWriter(), r = p.stdout.getReader();
+  const enc = new TextEncoder(), dec = new TextDecoder();
+  let buf = '', n = 0;
+  return {
+    async run(cmd) {
+      const tag = `@@${++n}@@ `;
+      await w.write(enc.encode(`{ ${cmd}\n} 2>&1; echo "${tag}$?"\n`));
+      for (;;) {
+        const m = new RegExp(`${tag}(\\d+)\n`).exec(buf);
+        if (m) {
+          const out = buf.slice(0, m.index);
+          buf = buf.slice(m.index + m[0].length);
+          return { code: +m[1], out };
+        }
+        const { value, done } = await r.read();
+        if (done) throw new Error(`the shell ended before ${cmd}`);
+        buf += dec.decode(value, { stream: true });
+      }
+    },
+    async end() { await w.close(); await p.exited; },
+  };
+}
+
+// `n` MiB of spaces to `path` by bash's own printf
+const fill = (path, n) => `printf '%*s' ${n * MB} '' > ${path}`;
+
 export default async function (t) {
   const { eq, check, timeout } = t;
   const sys = new System({ baseUrl: t.baseUrl, debug: t.debug() });
@@ -71,9 +105,11 @@ export default async function (t) {
   fs.addTar(t.work('slim/debian-slim.tar.zst'));
   await timeout(sys.boot(), 120000, 'boot');
   eq('boot writes nothing to the store', fs.written, 0);
+  const stay = shell(sys);
+  const keep = (what, cmd) => timeout(stay.run(cmd), 120000, what);
   if (t.phase === 1) {
     // fsync (dd conv=fsync), then fdatasync.
-    let r = await sh(t, sys, 'dd if=/dev/zero of=/root/a bs=65536 count=32 2>/dev/null');
+    let r = await keep('a write', fill('/root/a', 2));
     eq('a write', r.code, 0);
     eq('stays in the cache', fs.written, 0);
     r = await sh(t, sys, 'dd if=/dev/zero of=/root/b bs=65536 count=32 conv=fsync 2>/dev/null');
@@ -86,7 +122,8 @@ export default async function (t) {
     // sync(2) and syncfs(2) (sync -f): what is still only in the cache.
     for (const [what, cmd] of [['sync', 'sync'], ['syncfs', 'sync -f /root']]) {
       const n = what === 'sync' ? 'f' : 'g';
-      r = await sh(t, sys, `dd if=/dev/zero of=/root/${n} bs=65536 count=16 2>/dev/null`);
+      r = await keep(`${what}: a write`, fill(`/root/${n}`, 1));
+      eq(`${what}: a write`, r.code, 0);
       const w1 = fs.written, f1 = fs.flushes;
       r = await sh(t, sys, cmd);
       check(`${what}: the rest reached the store, flushed`, r.code === 0 && fs.written >= w1 + MB && fs.flushes > f1, `${r.code} ${r.out}: ${fs.written - w1} bytes, ${fs.flushes - f1} flushes`);
@@ -96,7 +133,8 @@ export default async function (t) {
     r = await sh(t, sys, 'dd if=/dev/zero of=/root/j bs=4194304 count=1 2>/dev/null');
     check('a 4 MiB write: in the store when it returns', r.code === 0 && fs.written >= w3 + 4 * MB, `${r.code}: ${fs.written - w3} bytes`);
     // The page's sync.
-    r = await sh(t, sys, 'dd if=/dev/zero of=/root/h bs=65536 count=16 2>/dev/null');
+    r = await keep('sys.sync(): a write', fill('/root/h', 1));
+    eq('sys.sync(): a write', r.code, 0);
     const w2 = fs.written, f2 = fs.flushes;
     await sys.sync();
     check('sys.sync(): the rest reached the store, flushed', fs.written >= w2 + MB && fs.flushes > f2, `${fs.written - w2} bytes, ${fs.flushes - f2} flushes`);
@@ -112,7 +150,7 @@ export default async function (t) {
     // The write-back's age: there without a sync, within a few seconds. (A
     // slow dd may already see some of it out: the file's creation ages too,
     // and the generation it makes takes every dirty block with it.)
-    const r = await sh(t, sys, 'dd if=/dev/zero of=/root/a bs=65536 count=32 2>/dev/null');
+    const r = await keep('a write', fill('/root/a', 2));
     eq('a write', r.code, 0);
     // (The flush follows the blocks' writes: wait for both.)
     await t.until(() => fs.written >= 2 * MB && fs.flushes >= 1, 'the write-back: the blocks reach the store within 8 s of a 1 s age, and it is flushed', 8000);
@@ -125,6 +163,7 @@ export default async function (t) {
     const again = await sh(t, sys, 'rm /root/a && dd if=/dev/zero of=/root/a bs=1048576 count=4 2>/dev/null && wc -c < /root/a');
     eq('room again', [again.code, again.out.trim()], [0, String(4 * MB)]);
   }
+  await stay.end();
   await sys.shutdown();
   if (t.phase < 3) return t.reload();
 }
