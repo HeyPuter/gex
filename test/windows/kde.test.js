@@ -65,11 +65,17 @@ export default async function (t) {
   // Konsole, and keys typed into it as the browser sends them.
   const ps = async () => (await timeout(sys.run(['ps', '-eo', 'pid,ppid,args'], { env }), 30000, 'ps')).stdout;
   sys.spawn(['/usr/bin/konsole'], { env, cwd: '/root' });
+  // A poll whose ps fails or takes over 30 s is "not yet", not the end of the
+  // wait (a busy single-thread page has had one ps take that long); how many
+  // there were is in the result's times.
+  let slow = 0;
   const shell = await until(async () => {
-    const rows = (await ps()).split('\n').map((l) => l.trim().split(/\s+/));
+    const out = await ps().catch(() => { slow++; return ''; });
+    const rows = out.split('\n').map((l) => l.trim().split(/\s+/));
     const k = rows.find((r) => /konsole$/.test(r[2] ?? ''));
     return k && rows.some((r) => r[1] === k[0] && /bash$/.test(r[2] ?? ''));
   }, 'Konsole and its shell', 300000).then(() => true, () => false);
+  t.record('Konsole wait: ps polls failed or over 30 s', slow);
   check('Konsole is up with its shell', shell, await ps().catch(() => ''));
   if (shell) {
     await new Promise((r) => setTimeout(r, 10000));
