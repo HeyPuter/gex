@@ -343,13 +343,7 @@ export async function guestNative(t, w, o = {}, pre = '', only = null) {
       t.check(`${pre}${n}: build`, false, String(e.message));
       continue;
     }
-    // On the page cbthrow ends in a host stack overflow: a jump out that
-    // lands less than NATIVE_UNWOUND above its call-out's return pad leaves
-    // that call-out running (gex does not abandon it), one more host level
-    // per jump, and a Worker's stack holds fewer of them than the 4000 jumps
-    // here (natively 20000 fit, 40000 do not).
-    const known = n === 'cbthrow' && o.page ? { known: 'call-outs left within NATIVE_UNWOUND nest on the host: gex core' } : {};
-    await w.nt({ want: allOk, ...o, ...known, name: `${pre}${n}`, exe, extra: [dll, `${dll}.wasm`] });
+    await w.nt({ want: allOk, ...o, name: `${pre}${n}`, exe, extra: [dll, `${dll}.wasm`] });
   }
 }
 

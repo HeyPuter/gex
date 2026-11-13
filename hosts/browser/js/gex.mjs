@@ -9428,10 +9428,12 @@ export class Gex {
     // Wine (its return is gex-kernel's NATIVE_RETURN_PAD) that names its
     // callee's argument bytes (cgen.rs `callout_span`): exactly those, as
     // its native caller's frames start just above them. One that names
-    // none: NATIVE_UNWOUND past the arguments.
+    // none: its return comes back within NATIVE_UNWOUND (`back`), and it is
+    // left past NATIVE_UNWOUND too unless its stack is known (below).
     const span = e.gex_callout_span?.() ?? -1n;
     c.span = span >= 0n ? span : CALLOUT_UNWOUND;
     c.unwound = span >= 0n ? span : c.ret === NATIVE_RETURN_PAD ? NATIVE_UNWOUND : CALLOUT_UNWOUND;
+    c.back = c.unwound;
     // WoW64's stops: reached with the stack anywhere, never unwound past
     // (a spWant of 0 is never read as unwound). The shim counts them for
     // its stray-arrival rule (`gex_wow64_waits`).
@@ -9444,6 +9446,12 @@ export class Gex {
     // The top of the stack it is made on: a stack pointer above it is
     // another fiber's (a stack of its own), not past the caller (`#left`).
     c.top = BigInt.asUintN(64, BigInt(e.gex_callout_stack_top?.(ctx, c.alt ? 1 : 0, BigInt.asIntN(64, c.spWant)) ?? -1));
+    // A guest call from native Wine with no argument bytes named, on a
+    // stack that is known: any jump out of it to a guest frame below (a
+    // longjmp or a catch past the native frames, however small they are)
+    // leaves it, not only one past NATIVE_UNWOUND, which would hold one
+    // more call-out open per jump landing within it.
+    if (span < 0n && c.ret === NATIVE_RETURN_PAD && !anyStack && c.top !== (1n << 64n) - 1n) c.unwound = 0n;
     // Deep inside others, one more needs the host's stack to have room for
     // it: native Wine's guest calls hold their native frames, which no trap
     // drops, so the shim's count cannot bound them (the shim ends the
@@ -9649,7 +9657,7 @@ export class Gex {
           // call-out waiting for the pad itself with the stack where it
           // wants it is simply done.
           if ((pc === NATIVE_RETURN_PAD || pc === STRAY_PC) && e.gex_callout_stray?.(0)) {
-            const mine = pc === NATIVE_RETURN_PAD && c.ret === NATIVE_RETURN_PAD && sp >= c.spWant && sp <= c.spWant + c.unwound;
+            const mine = pc === NATIVE_RETURN_PAD && c.ret === NATIVE_RETURN_PAD && sp >= c.spWant && sp <= c.spWant + c.back;
             if (mine) e.gex_callout_stray(1);
             new DataView(this.#memory.buffer).setBigUint64(ctx + CTX_PC, mine ? pc : STRAY_PC, true);
             if (globalThis.GEX_CALLOUT_TRACE) console.error(`[callout] depth ${me} leaves: native return pad reached (sp ${sp.toString(16)}${mine ? ', its own' : ''}; waited for ${c.ret.toString(16)}, dispatch ${e.gex_dispatch_ref(c.ret).toString(16)}, watching ${c.w ? `${c.w.table}:${c.w.index}` : 'nothing'})`);

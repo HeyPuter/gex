@@ -6283,8 +6283,10 @@ struct Callout {
     sp_want: u64,
     /// How far above `sp_want` a safepoint must find the stack pointer to
     /// call the caller unwound: `CALLOUT_UNWOUND`, or for a guest call from
-    /// native Wine its callee's argument bytes (`ftab::need_args`), or
-    /// `NATIVE_UNWOUND` when it names none.
+    /// native Wine its callee's argument bytes (`ftab::need_args`), none
+    /// when it names none and its stack is known (`stack_top`: anything
+    /// above its frame there is the native frames' or the guest's below
+    /// them), else `NATIVE_UNWOUND`.
     unwound: u64,
     /// How far above `sp_want` the awaited return may come back:
     /// `CALLOUT_UNWOUND`, or for a guest call from native Wine that names its
@@ -6383,10 +6385,11 @@ pub(crate) fn innermost_native_unwound(caller: &Caller<'_, HostState>, sp: u64) 
 }
 
 /// The same for a guest call from native Wine (its return address is
-/// `tramp::NATIVE_RETURN_PAD`): the callee's frame is built just below the
-/// native caller's (gexrt `__gexw_guest_call`), so anything past its
-/// arguments is the native frames' and the guest has left them -- a catch
-/// block continuing in an outer frame. Its native callers then leave
+/// `tramp::NATIVE_RETURN_PAD`) that names no argument bytes, made on a stack
+/// the TEB does not name (`x86::callout_stack_top`): the callee's frame is
+/// built just below the native caller's (gexrt `__gexw_guest_call`), so
+/// anything past its arguments is the native frames' and the guest has left
+/// them -- a catch block continuing in an outer frame. Its native callers then leave
 /// (gexrt's `run_until` drops them), instead of the guest running on
 /// nested inside them.
 const NATIVE_UNWOUND: u64 = 512;
@@ -7051,6 +7054,14 @@ fn call_out(caller: &mut Caller<'_, HostState>, ctx_i: i32, target: u64, ret: u6
     } else {
         u64::MAX
     };
+    // A guest call from native Wine whose stack is known is left by any
+    // jump out of it to a guest frame below (a longjmp or a catch past the
+    // native frames, however small they are), not only one past
+    // NATIVE_UNWOUND: each jump that lands within it would hold one more
+    // call-out open.
+    if pad && args.is_none() && stack_top != u64::MAX {
+        unwound = 0;
+    }
     caller.data_mut().callouts.push(Callout { ret, sp_want, unwound, span, alt, stack_top, slot: None, live: false });
     let me = caller.data().callouts.len() - 1;
     refresh_callouts(&mut *caller)?;
